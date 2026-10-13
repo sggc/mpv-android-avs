@@ -102,7 +102,10 @@ Android 产物在 `artifacts/{arm64-v8a,armeabi-v7a}/`，最终上传到对应 r
 ```
 checkout 本仓库
   → 下载依赖（davs2 1.6 / uavs3d / ...）
-  → Apply 10-bit patches        ← git apply，不是 sed
+  → Apply davs2 / uavs3d patches   ← git apply，不是 sed
+       ├ davs2-10bit.patch          （10bit 三处）
+       ├ davs2-seek-deadlock.patch  （seek 后 mutex_aec 锁泄漏 → ANR 根因）
+       └ uavs3d-10bit.patch         （clone 之后单独应用）
   → Patch davs2 source          ← 上游的线程池同步化 + NULL 安全
   → Build libuavs3d             ← cmake -DCOMPILE_10BIT=1
   → Build libmpv / FFmpeg       ← davs2.sh 里 --bit-depth=10
@@ -176,6 +179,15 @@ ffmpeg -v error -y -i input.mkv -map 0:v:0 -c:v copy -f data out.avs2
 
 * **davs2 是 C++ 编的**（`.so` 有 `_Z` 符号），dlopen 时找不到
   `libc++_shared.so` 会直接失败 —— 记得一起推。
+* **davs2 1.6 分支有 seek 死锁缺陷**（`mutex_aec` 泄漏）：seek 后参考帧找不到
+  时 `decoder_decode_es_unit()` 不解锁就走人，下一次 `send_packet` 永久阻塞。
+  上游 `master` 已修，`1.6` 没有 —— 由 `patches/davs2-seek-deadlock.patch` 补上。
+  详见 `patches/README.md`。**这是「拖进度条卡死闪退」的根因。**
+* **app 侧不要把 `mpv_get_property` 放在主线程**：`mpv_get_property` 是同步调用，
+  mpv core 一卡住它就永不返回 → 5 秒输入超时 → ANR。本项目实测的主线程栈是
+  `CustomSeekView.onScrubStop → seekToTimeBarPosition → updateProgress →
+  PlayerManager.getPosition → mpv_get_property`。这是独立于 davs2 的结构性隐患，
+  本仓库修不了，需要在 app 侧改（见「待办」）。
 * **`send_packet` 必须按 access unit 喂**（起始码 `00 00 01` + `B0`/`B3`/`B6`
   边界），整包 send 不产帧；`recv_frame` 返回 `DAVS2_DEFAULT` 时要继续轮询，
   不能 break。
@@ -187,6 +199,11 @@ ffmpeg -v error -y -i input.mkv -map 0:v:0 -c:v copy -f data out.avs2
 ## 待办
 
 - [x] uavs3d 10bit 真机复验 —— **通过**（14 帧，`bit_depth=10`，`ERR_BAD_BITDEPTH=0`）
+- [x] davs2 seek 死锁修复（`davs2-seek-deadlock.patch`）—— 待 CI 重编后真机复验
+- [ ] **app 侧加固**：`CustomSeekView.updateProgress()` 在松手回调里同步调
+      `PlayerManager.getPosition()` → `mpv_get_property()`（阻塞）。应改为
+      后台线程读取 + 缓存（或改用 mpv 的 `time-pos` 属性变更事件），
+      否则 mpv 任何一次卡住都会变成 ANR。**本仓库不涉及，需在 app 里改。**
 - [ ] 10bit 出帧后验证 mpv VO 能否吃 `yuv420p10le`（下一步）
 - [ ] HDR 元数据透传（`CCTV8K` 是 bt2020 + HLG / `arib-std-b67`）；
       app 侧 `Avs2Reader` 目前只报 `video/avs3`、不带色彩信息

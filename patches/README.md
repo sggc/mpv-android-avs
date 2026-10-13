@@ -72,6 +72,129 @@ if (!shift1 && sizeof(pel_t) == num_bytes_per_sample) {
 
 ---
 
+## davs2-seek-deadlock.patch
+
+**目的**：修掉「播放本地 AVS2 文件时拖进度条 → 画面卡死 → 应用被 ANR 杀掉」的根因。
+
+### 症状（真机实测，vivo PD2520 / arm64）
+
+拖动进度条松手后：
+
+```
+MpvEngine  W  seekTo(2914ms) prepared=true rtspVod=false
+[mkv:v]       queuing seek to 2.937000
+[cplayer:v]   hr-seek, skipping to 2.914000
+[mkv:v]       EOF reached.
+              ← 此后 5 秒 mpv 完全无输出
+              ← 5s 后 ANR，进程被杀，应用重启
+```
+
+ANR 原文（`dumpsys activity lastanr`）：
+
+```
+Reason: Input dispatching timed out (...VideoActivity is not responding.
+        Waited 5001ms for MotionEvent).
+```
+
+### 完整线程栈（来自 dropbox 的 data_app_anr）
+
+主线程 —— 卡在**阻塞式** mpv 属性读取上：
+
+```
+"main" tid=1 Native
+  libc.so  pthread_cond_wait
+  libmpv.so   (mpv_get_property+104)
+  libplayer.so Java_is_xyz_mpv_MPV_getPropertyDouble+68
+  MpvPlayerEngine.getPosition
+  PlayerManager.getPosition
+  CustomSeekView.updateProgressFromManager
+  CustomSeekView.updateProgress
+  CustomSeekView.seekToTimeBarPosition        ← 松手回调里同步调了 updateProgress()
+  CustomSeekView.onScrubStop
+  androidx.media3.ui.DefaultTimeBar.stopScrubbing
+  androidx.media3.ui.DefaultTimeBar.onTouchEvent   ← 用户的 MotionEvent
+```
+
+视频解码线程 —— 卡在 **libdavs2 内部的互斥锁**上：
+
+```
+"Thread-20" tid=98 Native
+  libc.so  NonPI::MutexLockWithTimeout        ← pthread_mutex_lock，永久阻塞
+  libdavs2.so (decoder_decode_es_unit+200)    ← davs2.cc:595 的 mutex_aec
+  libdavs2.so (davs2_decoder_send_packet+180)
+  libavcodec.so (avcodec_send_packet+172)
+  libmpv.so ...
+```
+
+### 根因
+
+`source/common/davs2.cc` 的 `decoder_decode_es_unit()`：
+
+```c
+davs2_thread_mutex_lock(&mgr->mutex_aec);              // 595 加锁
+
+if (parse_header(h, &es_unit->bs) == 0) {
+    h->p_bs = &es_unit->bs;
+    if (task_get_references(h, es_unit->pts, es_unit->dts) == 0) {
+        ...
+        davs2_thread_mutex_unlock(&mgr->mutex_aec);    // 609 解锁
+        davs2_threadpool_run(...);
+    }
+    // ← task_get_references() 返回 -1 时【没有解锁】← 锁泄漏
+} else {
+    davs2_thread_mutex_unlock(&mgr->mutex_aec);        // 614 解锁
+    task_unload_packet(h, es_unit);
+}
+```
+
+`task_get_references()`（`header.cc:1232`）在多处 `goto fail` → `return -1`，
+最典型的是 L1311-1315：
+
+```c
+if (j == mgr->dpbsize) {
+    davs2_log(h, DAVS2_LOG_ERROR, "reference frame of [coi: %d, poc: %d]: <COI: %d> not found.", ...);
+    goto fail;
+}
+```
+
+**seek 正好会命中这条路**：跳转后 DPB 里还是上一个 GOP 的帧，新位置要参考的
+帧找不到 → 返回 -1 → `mutex_aec` **永久留在锁定状态** → 下一次
+`davs2_decoder_send_packet()` 在 595 行阻塞到天荒地老。
+
+于是：视频解码线程挂住 → mpv core 跟着卡住 → 主线程那次阻塞式
+`mpv_get_property("time-pos")` 永不返回 → 5 秒输入超时 → **ANR → 进程被杀**。
+用户看到的就是「卡住然后闪退」。
+
+### 修法
+
+补上和 `if` 配对的 `else` 分支（**与上游 master 完全一致**）：
+
+```c
+        } else {
+            davs2_thread_mutex_unlock(&mgr->mutex_aec);
+            /* task is free */
+            task_unload_packet(h, es_unit);
+        }
+```
+
+> **上游对照**：`master` 分支的这个 `else` 分支**是有的**；工作流 pin 的
+> `--branch 1.6` **没有**。也就是说这是 1.6 分支的已知缺陷，上游后来修了。
+> 补丁内容就是上游那几行，没有自创逻辑。
+
+修好之后，seek 后参考帧找不到只会**丢这一帧**（`task_unload_packet` + 返回
+-1，`send_packet` 返回 `DAVS2_ERROR`，FFmpeg wrapper 走既有的
+"Decoder warning: can't read packet, flushing" 分支），不再有锁泄漏，
+也就不会再死锁。
+
+### 这个补丁**不解决**的事
+
+它只堵住锁泄漏。`CustomSeekView.seekToTimeBarPosition()` 里那句
+**主线程同步**的 `updateProgress()` → `mpv_get_property()` 仍然是
+"mpv 一旦卡住就必然 ANR" 的结构性隐患（本仓库 app 侧待改）。
+davs2 修好只是让这次不再触发它。
+
+---
+
 ## uavs3d-10bit.patch
 
 **目的**：让 uavs3d 输出 10bit。官方默认就是 8bit-only。

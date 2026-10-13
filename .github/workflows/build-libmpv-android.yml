@@ -216,7 +216,7 @@ jobs:
       #   davs2  CCTV4K.AVS2-10bit 3840x2160@50 -> 16 帧, bit_depth=10, err=0
       #   davs2  8bit 回归 test1/风电 -> 正常出帧, 不退化
       # ---------------------------------------------------------------------
-      - name: Apply 10-bit patches (davs2 / uavs3d)
+      - name: Apply davs2 / uavs3d patches (10-bit + seek deadlock fix)
         run: |
           cd "$GITHUB_WORKSPACE"
           # 本仓库被 checkout 到 $GITHUB_WORKSPACE 根，patches/ 就在下面
@@ -248,6 +248,9 @@ jobs:
           [ -n "$DAVS2_DIR" ] || DAVS2_DIR=$(find "$GITHUB_WORKSPACE" -maxdepth 5 -type d \
                         -name davs2 -path "*/deps/*" 2>/dev/null | head -1)
           apply "davs2"  "$DAVS2_DIR" davs2-10bit.patch
+          # davs2: seek 后 mutex_aec 泄漏导致永久死锁（拖住整个视频管线 → ANR）
+          # upstream master 已有 else 分支，我们 pin 的 1.6 分支没有 —— 补上。
+          apply "davs2"  "$DAVS2_DIR" davs2-seek-deadlock.patch
 
           # uavs3d 的补丁**不在这里**打：uavs3d-src 要到后面的
           # "Build libuavs3d" step 才 clone，此刻目录还不存在。

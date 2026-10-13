@@ -64,6 +64,7 @@ DAVS2=$(find "$ROOT/mpv-android/buildscripts/deps" -maxdepth 1 -type d -name dav
 UAVS3D="$ROOT/uavs3d-src"
 
 apply "davs2"  "$DAVS2"  davs2-10bit.patch  || rc=1
+apply "davs2"  "$DAVS2"  davs2-seek-deadlock.patch || rc=1
 apply "uavs3d" "$UAVS3D" uavs3d-10bit.patch || rc=1
 
 echo

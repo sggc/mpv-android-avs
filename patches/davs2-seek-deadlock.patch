@@ -1,0 +1,29 @@
+diff --git a/source/common/davs2.cc b/source/common/davs2.cc
+--- a/source/common/davs2.cc
++++ b/source/common/davs2.cc
+@@ -606,12 +606,25 @@
+             mgr->num_frames_in++;
+ 
+             /* ½âËø */
+             davs2_thread_mutex_unlock(&mgr->mutex_aec);
+             /* decode picture data */
+             davs2_threadpool_run((davs2_threadpool_t *)mgr->thread_pool, decoder_decode_picture_data, h, 0, 0);
++        } else {
++            /* BUGFIX: upstream master has this else-branch, branch 1.6 does NOT.
++             * When task_get_references() fails (typical right after a seek: the DPB
++             * still holds the previous GOP's frames, so the reference frame of the
++             * new position is "not found" -> header.cc goto fail -> return -1),
++             * mutex_aec was left LOCKED. The next davs2_decoder_send_packet() then
++             * blocks forever on that mutex: the video decode thread hangs, mpv's
++             * core wedges with it, and any blocking mpv_get_property() call from
++             * the app's main thread never returns -> 5s input timeout -> ANR.
++             * Symptom: seeking a local AVS2 file freezes then kills the app. */
++            davs2_thread_mutex_unlock(&mgr->mutex_aec);
++            /* task is free */
++            task_unload_packet(h, es_unit);
+         }
+     } else {
+         davs2_thread_mutex_unlock(&mgr->mutex_aec);
+         /* task is free */
+         task_unload_packet(h, es_unit);
+     }
