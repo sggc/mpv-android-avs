@@ -1409,25 +1409,36 @@ jobs:
           fi
           [ -d "$FFMPEG_DIR/libavcodec" ] || { echo "ERROR: no FFmpeg"; exit 1; }
 
-          echo "=== Step 1: Download prebuilt libavs3a_decoder.so ==="
+          echo "=== Step 1: 取用仓库内固定版本的 libavs3a_decoder.so ==="
           cd "$GITHUB_WORKSPACE"
-          mkdir -p av3a-libs
-          case "${{ matrix.arch.name }}" in
-            arm64-v8a)
-              curl -fsSL "https://github.com/wuxianlin/ijkplayer-av3a/raw/master/ijkplayer-java/jniLibs/arm64-v8a/libavs3a_decoder.so" \
-                -o av3a-libs/libavs3a_decoder.so
-              ;;
-            armeabi-v7a)
-              curl -fsSL "https://github.com/wuxianlin/ijkplayer-av3a/raw/master/ijkplayer-java/jniLibs/armeabi-v7a/libavs3a_decoder.so" \
-                -o av3a-libs/libavs3a_decoder.so
-              ;;
-          esac
-          ls -lh av3a-libs/libavs3a_decoder.so || { echo "ERROR: Failed to download libavs3a_decoder.so"; exit 1; }
 
-          # Download model.bin (neural network model needed by AV3A decoder at runtime)
-          curl -fsSL "https://github.com/wuxianlin/ijkplayer-av3a/raw/master/ijkplayer-example/src/main/assets/model.bin" \
-            -o av3a-libs/model.bin || echo "WARNING: model.bin not downloaded"
-          ls -lh av3a-libs/model.bin 2>/dev/null || true
+          # 不再从外部仓库（wuxianlin/ijkplayer-av3a）下载。
+          # 那个预编译版（约 254K）与 App 里验证通过的**不是同一个构建**，
+          # 且 src/av3a_dec.c 在缺公开 API 时会回退到签名不同的内部符号名
+          # —— 历史上正是那条路 SIGSEGV。
+          # 现改为使用仓库内 pin 住的版本（av3a-libs/），并用 SHA256SUMS 校验。
+          # 详见 av3a-libs/README.md
+          ARCH="${{ matrix.arch.name }}"
+          SRC_SO="av3a-libs/${ARCH}/libavs3a_decoder.so"
+          [ -f "$SRC_SO" ] || { echo "ERROR: 缺 $SRC_SO"; ls -la av3a-libs/ 2>/dev/null; exit 1; }
+
+          echo "--- 校验 SHA256 ---"
+          if [ -f av3a-libs/SHA256SUMS ]; then
+            # 只校验本次用到的两个文件，避免 model.bin 行号/格式差异影响
+            if command -v sha256sum >/dev/null; then
+              (cd av3a-libs && grep -E "${ARCH}/libavs3a_decoder\.so|model\.bin" SHA256SUMS \
+                | sha256sum -c -) || { echo "ERROR: SHA256 校验失败 —— av3a-libs 内容被改动？"; exit 1; }
+            else
+              echo "WARNING: 无 sha256sum，跳过校验"
+            fi
+          else
+            echo "WARNING: 无 av3a-libs/SHA256SUMS，跳过校验"
+          fi
+
+          # 铺平成后续步骤期望的路径 av3a-libs/libavs3a_decoder.so
+          cp "$SRC_SO" av3a-libs/libavs3a_decoder.so
+          ls -lh av3a-libs/libavs3a_decoder.so
+          ls -lh av3a-libs/model.bin
 
           echo "=== Step 1b: Inspect libavs3a_decoder.so symbols ==="
           NM_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
@@ -1467,7 +1478,10 @@ jobs:
               fi
             done
             if [ -n "$api_missing" ]; then
-              echo "::warning title=AV3A 将回退到内部符号名::下载的 libavs3a_decoder.so 缺公开 API:$api_missing —— wrapper 会回退到 Avs3AllocDecoder/Avs3ParseBsFrameHeader/Avs3Decode，而这些符号签名不同，是历史上崩溃的路径。请确认该 .so 是否与 App 内已验证版本(约347K)一致。"
+              # 来源已 pin 在 av3a-libs/ 并做过 SHA256 校验，这里还缺就说明
+              # 资产本身被换过 —— 直接 fail，不产出会崩的包。
+              echo "::error title=AV3A 公开 API 缺失::av3a-libs 的 libavs3a_decoder.so 缺:$api_missing —— wrapper 将回退到签名不同的内部符号名（历史 SIGSEGV 路径）。请核对 av3a-libs/README.md 并重新真机验证。"
+              exit 1
             else
               echo "  [OK]   公开 API 齐全，wrapper 不会走内部名回退路径"
             fi

@@ -2,13 +2,13 @@
 artifacts/
 out/
 *.o
-*.so
 *.a
 *.d
 
 # 依赖源码（CI 会自己 clone）
 deps/
 uavs3d-src/
+uavs3d-build/
 mpv-android/
 
 # 平台/编辑器
@@ -18,9 +18,14 @@ Thumbs.db
 .idea/
 .vscode/
 
-# 例外：探针源码与 patch 要入库
-!probes/
-!patches/
+# ---- .so 默认不入库，但有两个例外 ----
+*.so
+
+# 例外 1：av3a-libs/ 是**固定的构建输入**，必须入库。
+#   它是已验证的 AV3A 解码器（含公开 API），pin 在这里保证可复现，
+#   不再从外部仓库下载。详见 av3a-libs/README.md。
+#   注意：* 只排除文件不排除目录，所以这里能重新包含。
+!av3a-libs/**/*.so
 
 # 探针只留源码；编译出的可执行文件（无扩展名或 .32/.64 后缀）不入库
 probes/*32

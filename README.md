@@ -11,6 +11,7 @@ AV3A(Audio Vivid) 音频的 `libmpv.so` / `libavcodec.so` 等一套 `.so`。
 | `.github/workflows/` | 构建工作流（Android / 其他平台 / Windows） |
 | `patches/` | 应用在上游依赖上的补丁，**每处都写了为什么** |
 | `src/` | `av3a_dec.c` —— FFmpeg 的 AV3A 解码器 wrapper 源码 |
+| `av3a-libs/` | **固定版本**的 AV3A 解码器与 `model.bin`（CI 直接用，带 SHA256 校验） |
 | `probes/` | 真机能力探针，用来验证"到底能不能解" |
 | `scripts/` | 补丁应用、位深自检、native 库提取 |
 | `logs/` | 历史构建日志（含失败与成功案例，作对照） |
@@ -159,6 +160,17 @@ adb shell "cd /data/local/tmp/avsprobe && \
 ffmpeg -v error -y -i input.mkv -map 0:v:0 -c:v copy -f data out.avs2
 # AVS3 同理，扩展名用 .avs3
 ```
+
+### AV3A 解码器为什么 pin 在仓库里
+
+原先从 `wuxianlin/ijkplayer-av3a` 下载预编译版（约 254K）。但那是**另一个构建**，
+和 App 里验证通过的不是同一个文件；而 `src/av3a_dec.c` 在缺公开 API 时会
+**回退到签名不同的内部符号名**（`parse_header` 4 参 vs 6 参、`avs3_decode`
+不收输入缓冲）—— 历史上正是这条回退路径导致过 SIGSEGV。
+
+所以现在把已验证的版本放进 `av3a-libs/`（两个 ABI + `model.bin`），
+附 `SHA256SUMS`，CI 取用前校验、并逐个核对公开 API（缺失即 fail）。
+输入固定、可复现，外部仓库怎么变都影响不到这里。详见 `av3a-libs/README.md`。
 
 ### 已知坑
 
