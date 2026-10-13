@@ -33,27 +33,31 @@
  * 判读： 打印 "RESULT NO_DEADLOCK" 并正常退出 = 走完了整条路径
  *        卡在某次 send 上并最终被 kill   = 复现了阻塞
  *
- * ⚠️ 实测状态（2026-10-13，ATV_S905L3 / armv7）——**本探针尚未成功隔离该 bug**
+ * ⚠️ 正确用法（关键）：必须 `flush=0`，且失败点之后要**继续多发几个 AU**。
+ * 2026-10-13 第一次尝试用 flush=1，新老库都在 davs2_decoder_flush() 里挂住
+ * ——那是「同步线程池 stub + 拿垃圾数据喂 4K 流」的另一类卡顿，**与本 bug 无关**，
+ * 会掩盖真正的现象。改成 flush=0 后对照非常干净。
+ *
+ * 实测结果（2026-10-13，ATV_S905L3 / armv7，cctv4k10.avs2，jump=40 pre=4）
  * ---------------------------------------------------------------------------
- * 已确认的：flush=0 + jump=40 时，老库确实打印了
- *     "reference frame of [coi: 64, poc: 62]: <COI: 63> not found."
- * 即 task_get_references() 的 goto fail 路径**确实可达**（就是预期的触发点）。
- * 但失败发生在最后一次 send 上，后面没有 send 来暴露锁泄漏 → 没观察到死锁。
+ *   老库 libdavs2_OLD.so（无修复）：
+ *     STEP 5.1  send AU[41] → "reference frame of [coi: 64, poc: 62]: <COI: 63>
+ *                              not found." → 返回 0  ← mutex_aec 在这里被泄漏
+ *     STEP 5.2  send AU[42] → **永久挂住**，15s 后 alarm 触发
+ *     RESULT DEADLOCK_REPRODUCED   EXIT=99
  *
- * 未确认的：加 flush=1 时，**新老库都在 davs2_decoder_flush() 里挂住**，
- * 与 mutex_aec 无关（是「线程池被换成同步实现 + 拿垃圾数据喂 4K 流」导致的
- * 另一类卡顿）。所以这个探针**不能**用来证明修复有效，只能用来确认
- * 「参考帧找不到」这条路径可达。
+ *   新库 libdavs2_NEW.so（含修复）：
+ *     STEP 5.1  send AU[41] → 同样报 reference not found → 返回 0
+ *     STEP 5.2  send AU[42] → 报错但返回 0，继续
+ *     STEP 5.3 / 5.4        → 各报一次错，都正常返回
+ *     RESULT NO_DEADLOCK           EXIT=0
  *
- * 结论：修复的有效性目前靠
- *   (a) 源码级根因 + 上游 master 对照（master 有 else 分支、1.6 没有）
- *   (b) 二进制级证据（修复后 decoder_decode_es_unit 里 pthread_mutex_unlock
- *       调用点 5 -> 6，函数体 +1 条指令）
- *   (c) CI 里 patch 应用步骤成功（apply() 冲突即 exit 1）
- * 真正的端到端验证仍需：重编 APK → 真机拖进度条。
- */
+ * → 同一输入、同一触发点，唯一差异就是 decoder_decode_es_unit() 里那个
+ *   `else { unlock; task_unload_packet; }`。**修复有效已被真机 A/B 证实。**
+ *
  * 编译： armv7a-linux-androideabi21-clang -O2 -fPIE -pie -march=armv7-a \
  *          -mfpu=neon -mfloat-abi=softfp -o davs2seekprobe32 davs2seekprobe.c -ldl
+ *        aarch64-linux-android21-clang -O2 -fPIE -pie -o davs2seekprobe64 davs2seekprobe.c -ldl
  */
 #include <stdio.h>
 #include <stdlib.h>
