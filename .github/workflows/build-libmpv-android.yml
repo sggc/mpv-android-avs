@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag (e.g. libmpv-cavs-dynamic-latest)"
-        required: true
-        default: "libmpv-cavs-dynamic-latest"
+        description: "发布 tag（留空 = 在上次版本上自动 +1；格式 libmpv-cavs-dynamic-vNNN）"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -2225,6 +2225,57 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # -------------------------------------------------------------------
+      # 版本号自动递增
+      #
+      # 规则：从本仓库的所有 release tag 里解析出最大的 N，+1，格式化为
+      #       libmpv-cavs-dynamic-vNNN（3 位补零，保证字典序=数字序）。
+      # 手动在 workflow_dispatch 里填 release_tag 则优先用填的值。
+      #
+      # 之所以不用日期：日期排序在大版本回溯/补发时会乱，递增号最直观，
+      # 也能一眼看出"这次比上次新"。
+      # -------------------------------------------------------------------
+      - name: Compute release version
+        id: ver
+        run: |
+          PREFIX="libmpv-cavs-dynamic-v"
+
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            VER="${{ inputs.release_tag }}"
+            echo "使用手动指定版本: $VER"
+          else
+            # 取最近 100 个 release 的 tag，正则抠出 -vNNN 尾号，取最大 N
+            # ⚠️ 必须用 awk '{printf "%d",$0}' 去掉前导零：本仓库用 %03d 补零
+            # （v001/v012…），而 bash 的 $((012)) 会按**八进制**解析 → 10，
+            # 到 v010 之后版本号就会开始算错。实测踩过。
+            LAST=$(curl -fsSL \
+              "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
+              | jq -r '.[].tag_name // empty' \
+              | grep -oE "^${PREFIX}[0-9]+$" \
+              | sed "s/^${PREFIX}//" \
+              | awk '{printf "%d\n", $0}' \
+              | sort -n | tail -1)
+
+            if [ -z "$LAST" ]; then
+              NEXT=1
+              echo "未找到历史版本，从 v001 开始"
+            else
+              NEXT=$(( LAST + 1 ))
+              echo "历史最大版本号: ${LAST} -> 本次: ${NEXT}"
+            fi
+            VER=$(printf "%s%03d" "$PREFIX" "$NEXT")
+          fi
+
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "本次发布版本: $VER"
+
+          # 顺带把发布内容摘要写进 job summary，回滚时一眼看到差异
+          {
+            echo "## 发布 $VER"
+            echo "- 触发方式: ${{ inputs.release_tag != '' && '手动指定' || '自动递增' }}"
+            echo "- 提交: ${{ github.sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -2270,7 +2321,9 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag }}
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: ${{ steps.ver.outputs.version }}
+          make_latest: true
           files: release/libmpv-cavs-android-dynamic.tar.gz
           fail_on_unmatched_files: true
           overwrite_files: true

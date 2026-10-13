@@ -81,13 +81,20 @@ davs2 的版本串后缀自证位深：`.10` = 10bit、`.8` = 8bit。
 
 ## 构建
 
-工作流是 `workflow_dispatch` 手动触发，需要给一个 release tag：
+工作流是 `workflow_dispatch` 手动触发，**`release_tag` 留空即可自动递增**：
 
 ```yaml
-release_tag: "libmpv-cavs-dynamic-latest"
+release_tag: ""     # 留空 = 自动 +1
 ```
 
+版本号规则：`libmpv-cavs-dynamic-vNNN`（3 位补零）。触发时读取本仓库所有
+release tag，取最大 N 加一。手动填了就用填的值。
+
 Android 产物在 `artifacts/{arm64-v8a,armeabi-v7a}/`，最终上传到对应 release。
+
+> ⚠️ 补零 + bash 算术有个坑：`$((012))` 会被当**八进制**解析成 10，
+> 所以必须先 `awk '{printf "%d",$0}'` 去掉前导零再做加法 ——
+> 否则从 `v010` 起版本号就会开始算错。工作流里已处理并注释。
 
 ### 工作流里 10bit 是怎么进去的
 
