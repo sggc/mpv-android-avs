@@ -1398,6 +1398,12 @@ jobs:
           grep -n 'enable-' scripts/ffmpeg.sh
 
       - name: Download AV3A decoder library and patch FFmpeg
+        env:
+          # 用 step 级 env 传 arch，而不是在 run 块里写 ${{ matrix.arch.name }}。
+          # 原因见 commit message：run 块内含 ${{ }} 时 GitHub 的表达式扫描器
+          # 会报 "Exceeded max expression length 21000"（本 step 的 run 块本身
+          # 就超过 21000 字符）。放 env 里可彻底避开。
+          ARCH: ${{ matrix.arch.name }}
         run: |
           cd mpv-android/buildscripts
           FFMPEG_DIR=""
@@ -1418,15 +1424,14 @@ jobs:
           # —— 历史上正是那条路 SIGSEGV。
           # 现改为使用仓库内 pin 住的版本（av3a-libs/），并用 SHA256SUMS 校验。
           # 详见 av3a-libs/README.md
-          ARCH="${{ matrix.arch.name }}"
-          SRC_SO="av3a-libs/${ARCH}/libavs3a_decoder.so"
+          SRC_SO="av3a-libs/$ARCH/libavs3a_decoder.so"
           [ -f "$SRC_SO" ] || { echo "ERROR: 缺 $SRC_SO"; ls -la av3a-libs/ 2>/dev/null; exit 1; }
 
           echo "--- 校验 SHA256 ---"
           if [ -f av3a-libs/SHA256SUMS ]; then
             # 只校验本次用到的两个文件，避免 model.bin 行号/格式差异影响
             if command -v sha256sum >/dev/null; then
-              (cd av3a-libs && grep -E "${ARCH}/libavs3a_decoder\.so|model\.bin" SHA256SUMS \
+              (cd av3a-libs && grep -E "$ARCH/libavs3a_decoder\.so|model\.bin" SHA256SUMS \
                 | sha256sum -c -) || { echo "ERROR: SHA256 校验失败 —— av3a-libs 内容被改动？"; exit 1; }
             else
               echo "WARNING: 无 sha256sum，跳过校验"
@@ -1470,7 +1475,7 @@ jobs:
           if [ -f "$NM_TOOL" ]; then
             api_missing=""
             for sym in avs3_create_decoder avs3_destroy_decoder parse_header avs3_decode; do
-              if "$NM_TOOL" -D av3a-libs/libavs3a_decoder.so 2>/dev/null | grep -qE " T ${sym}$"; then
+              if "$NM_TOOL" -D av3a-libs/libavs3a_decoder.so 2>/dev/null | grep -qE " T $sym\$"; then
                 echo "  [OK]   公开 API 存在: $sym"
               else
                 echo "  [MISS] 公开 API 缺失: $sym"
