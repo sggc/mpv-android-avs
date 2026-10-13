@@ -209,10 +209,15 @@ ffmpeg -v error -y -i input.mkv -map 0:v:0 -c:v copy -f data out.avs2
 - [x] uavs3d 10bit 真机复验 —— **通过**（14 帧，`bit_depth=10`，`ERR_BAD_BITDEPTH=0`）
 - [x] davs2 seek 死锁修复（`davs2-seek-deadlock.patch`）—— 已真机 A/B 复验
 - [x] davs2 flush SIGSEGV 修复（`davs2-flush-crash.patch`）—— 已真机 A/B 复验
-- [ ] **app 侧加固**：`CustomSeekView.updateProgress()` 在松手回调里同步调    
-  `PlayerManager.getPosition()` → `mpv_get_property()`（阻塞）。应改为    
-  后台线程读取 + 缓存（或改用 mpv 的 `time-pos` 属性变更事件），    
-  否则 mpv 任何一次卡住都会变成 ANR。**本仓库不涉及，需在 app 里改。**
+- [x] **app 侧（最小缓解，已在 app 仓库改）**：`CustomSeekView.seekToTimeBarPosition()`
+      不再在松手回调里同步调 `updateProgress()`（它会走到阻塞的
+      `mpv_get_property("time-pos")`），改成 `postDelayed(runnable, 250)`。
+      这消除了实测到的那条 ANR 主线程栈：
+      `onScrubStop → seekToTimeBarPosition → updateProgress → getPosition → mpv_get_property`。
+- [ ] **app 侧（彻底方案，仍待做）**：`getPosition()` / `getDuration()` 整体挪到
+      后台线程（或改用 mpv 的 `time-pos` 属性变更事件 + 缓存）。现在
+      `CustomSeekView.updateTimeline()`（`onAttachedToWindow` 里）以及周期性
+      runnable 仍会在主线程读 mpv 属性 —— mpv 一旦卡住仍可能 ANR。
 - [ ] 10bit 出帧后验证 mpv VO 能否吃 `yuv420p10le`（下一步）
 - [ ] HDR 元数据透传（`CCTV8K` 是 bt2020 + HLG / `arib-std-b67`）；    
   app 侧 `Avs2Reader` 目前只报 `video/avs3`、不带色彩信息
