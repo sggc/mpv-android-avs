@@ -20,3 +20,12 @@
 
 # 日志/文本大文件按文本处理，但要 diff 就要明确标记，避免 git 当二进制
 *.txt       text
+
+# 显式声明二进制，禁止任何行尾/编码转换。
+# 虽然 text=auto 已能把含 NUL 的 .so/.bin 判为二进制（实测 blob 与工作区
+# 字节一致），但显式写死更保险 —— 避免将来 git 行为变化或有人加了
+# 形似文本的二进制导致静默损坏。av3a-libs/ 里的文件是构建输入，坏了就白跑。
+*.so  binary
+*.bin binary
+*.a   binary
+*.jar binary
