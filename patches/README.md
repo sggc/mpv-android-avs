@@ -186,6 +186,30 @@ if (j == mgr->dpbsize) {
 "Decoder warning: can't read packet, flushing" 分支），不再有锁泄漏，
 也就不会再死锁。
 
+### 真机 A/B 实测（决定性，2026-10-13，ATV_S905L3 / armv7）
+
+用 `probes/davs2seekprobe.c` 精确复现：喂序列头 → 正常解几帧 → 跳到流中段的
+P 帧（参考帧不在 DPB 里）→ 之后连发几个 AU。
+
+```
+老库（无修复）：
+  STEP 5.1  send AU[41] → "reference frame of [coi: 64, poc: 62]: <COI: 63> not found."
+                          → 返回 0        ← mutex_aec 在这里被泄漏
+  STEP 5.2  send AU[42] → 永久挂住（15s 后 alarm 触发）
+  RESULT DEADLOCK_REPRODUCED   EXIT=99
+
+新库（含修复）：
+  STEP 5.1  send AU[41] → 同样报 reference not found → 返回 0
+  STEP 5.2  send AU[42] → 报错但返回 0，继续
+  STEP 5.3 / 5.4        → 各报一次错，都正常返回
+  RESULT NO_DEADLOCK           EXIT=0
+```
+
+同一输入、同一触发点，唯一差异就是这一处 `else { unlock; ... }`。
+
+**回归**（新库）：AVS2 10bit 4K → 16 帧 `bit_depth=10 err=0`；
+AVS2 8bit → 3 帧 `bit_depth=8 err=0`，**不退化**。
+
 ### 这个补丁**不解决**的事
 
 它只堵住锁泄漏。`CustomSeekView.seekToTimeBarPosition()` 里那句
