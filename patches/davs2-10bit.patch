@@ -1,0 +1,111 @@
+diff --git a/build/linux/configure b/build/linux/configure
+index 4e0984f..df4b819 100755
+--- a/build/linux/configure
++++ b/build/linux/configure
+@@ -463,12 +463,13 @@ for opt do
+             ;;
+         --bit-depth=*)
+             bit_depth="$optarg"
++            # [10bit patch] ä¸Šæ¸¸åœ¨è¿™é‡Œ exit 1 æ‹’ç» 9/10bitã€‚æºç çš„
++            # HIGH_BIT_DEPTH è·¯å¾„å®Œæ•´ï¼ˆmc.cc çš„ g_bit_depth åŠ¨æ€ä½ç§»ã€
++            # pixel.cc çš„ #if HIGH_BIT_DEPTH åˆ†æ”¯ï¼‰ï¼Œåªæ˜¯æœªæ”¾å¼€ã€‚
++            # çŽ°æ”¹ä¸ºåªåšèŒƒå›´æ£€æŸ¥ã€‚
+             if [ "$bit_depth" -lt "8" -o "$bit_depth" -gt "10" ]; then
+                 echo "Supplied bit depth must be in range [8,10]."
+                 exit 1
+-            elif [[ "$bit_depth" = "9" || "$bit_depth" = "10" ]]; then
+-                echo "BitDepth $bit_depth not supported currently."
+-                exit 1
+             fi
+             bit_depth=`expr $bit_depth + 0`
+             ;;
+diff --git a/source/common/decoder.cc b/source/common/decoder.cc
+index 541f5d0..e6e81a6 100644
+--- a/source/common/decoder.cc
++++ b/source/common/decoder.cc
+@@ -50,7 +50,7 @@
+ 
+ #define TRACEFILE "trace_dec_HD.txt"  /* trace file in current directory */
+ 
+-/* disable warning C4127: Ìõ¼þ±í´ïÊ½ÊÇ³£Á¿ */
++/* disable warning C4127: ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê½ï¿½Ç³ï¿½ï¿½ï¿½ */
+ #pragma warning(disable:4127)
+ 
+ 
+@@ -73,7 +73,7 @@ static void init_frame(davs2_t *h)
+     h->i_slice_index       = -1;
+     h->b_slice_checked     = 0;
+     h->fdec->i_parsed_lcu_xy = -1;
+-    h->decoding_error      = 0;    // Çå³ý½âÂë´íÎó±êÖ¾
++    h->decoding_error      = 0;    // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¾
+ 
+     /* 1, clear intra_mode buffer, set to default value (-1) */
+     memset(h->p_ipredmode - h->i_ipredmode - 16, DC_PRED, h->i_ipredmode * (h->i_height_in_spu + 1) * sizeof(int8_t));
+@@ -222,7 +222,7 @@ static davs2_outpic_t *get_one_free_picture(davs2_mgr_t *mgr, int w, int h)
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * µÈ´ýÒ»ÐÐLCUìØ½âÂëÍêÖ¸¶¨ÊýÁ¿µÄLCU
++ * ï¿½È´ï¿½Ò»ï¿½ï¿½LCUï¿½Ø½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½LCU
+  */
+ static ALWAYS_INLINE
+ void wait_lcu_row_parsed(davs2_t *h, davs2_frame_t *frm, int lcu_xy)
+@@ -239,7 +239,7 @@ void wait_lcu_row_parsed(davs2_t *h, davs2_frame_t *frm, int lcu_xy)
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * µÈ´ýÒ»ÐÐLCU½âÂëÖØ¹¹ÍêÖ¸¶¨ÊýÁ¿µÄLCU
++ * ï¿½È´ï¿½Ò»ï¿½ï¿½LCUï¿½ï¿½ï¿½ï¿½ï¿½Ø¹ï¿½ï¿½ï¿½Ö¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½LCU
+  */
+ static ALWAYS_INLINE
+ void wait_lcu_row_reconed(davs2_t *h, davs2_frame_t *frm, int wait_lcu_y, int wait_lcu_coded)
+@@ -363,7 +363,7 @@ int check_slice_header(davs2_t *h, davs2_bs_t *bs, int lcu_y)
+         aec_start_decoding(p_aec, bs->p_stream, ((bs->i_bit_pos + 7) / 8), bs->i_stream);
+         AEC_RETURN_ON_ERROR(-1);
+ 
+-        /* µ±Ç°SliceµÄÉÏÒ»ÐÐµÄÔ¤²âÄ£Ê½Çå¿Õ */
++        /* ï¿½ï¿½Ç°Sliceï¿½ï¿½ï¿½ï¿½Ò»ï¿½Ðµï¿½Ô¤ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½ */
+         lcu_y <<= (h->i_lcu_level - MIN_PU_SIZE_IN_BIT);
+         memset(h->p_ipredmode + (lcu_y - 1) * h->i_ipredmode - 16, DC_PRED, h->i_ipredmode * sizeof(int8_t));
+     }
+@@ -960,10 +960,14 @@ void davs2_write_a_frame(davs2_picture_t *pic, davs2_frame_t *frame)
+ 
+     if (!shift1 && sizeof(pel_t) == num_bytes_per_sample) {
+         pic->dec_frame = frame;
+-        // TODO: ÈçÏÂ¸³ÖµÇ°µÄÖ¸ÕëÐèÒªÔÚÊÊµ±µÄÊ±ºò£¨½øÈëºóÐø·ÖÖ§Ê±£©»Ö¸´
+-        pic->planes[0]  = frame->planes[0];
+-        pic->planes[1]  = frame->planes[1];
+-        pic->planes[2]  = frame->planes[2];
++        // TODO: ï¿½ï¿½ï¿½Â¸ï¿½ÖµÇ°ï¿½ï¿½Ö¸ï¿½ï¿½ï¿½ï¿½Òªï¿½ï¿½ï¿½Êµï¿½ï¿½ï¿½Ê±ï¿½ò£¨½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö§Ê±ï¿½ï¿½ï¿½Ö¸ï¿½
++        /* [10bit patch] é›¶æ‹·è´å¿«è·¯å¾„ï¼šsizeof(pel_t)==æ¯æ ·æœ¬å­—èŠ‚æ•°æ—¶
++         * ï¼ˆ8bit 1==1ï¼Œ10bit 2==2ï¼‰æŠŠå†…éƒ¨ pel_t* ç¼“å†²ç›´æŽ¥æš´éœ²ç»™å¤–éƒ¨ API çš„
++         * uint8_t* planes[]ã€‚ä¸Šæ¸¸ç¼ºæ˜¾å¼è½¬åž‹ï¼›strides[] å·²æŒ‰å­—èŠ‚è®¡ï¼Œ
++         * è°ƒç”¨æ–¹æŒ‰ bytes_per_sample è§£é‡Šï¼Œå¼ºè½¬å®‰å…¨ã€‚ */
++        pic->planes[0]  = (uint8_t *)(frame->planes[0]);
++        pic->planes[1]  = (uint8_t *)(frame->planes[1]);
++        pic->planes[2]  = (uint8_t *)(frame->planes[2]);
+         pic->strides[0] = frame->i_stride[0] * num_bytes_per_sample;
+         pic->strides[1] = frame->i_stride[1] * num_bytes_per_sample;
+         pic->strides[2] = frame->i_stride[2] * num_bytes_per_sample;
+diff --git a/source/common/osdep.h b/source/common/osdep.h
+index 08bb05e..7b8ad0d 100644
+--- a/source/common/osdep.h
++++ b/source/common/osdep.h
+@@ -44,7 +44,7 @@ extern "C" {
+ #define _CRT_NONSTDC_NO_DEPRECATE
+ #define _CRT_SECURE_NO_DEPRECATE
+ #define _CRT_SECURE_NO_WARNINGS
+-#pragma warning(disable:4324)     /* disable warning C4324: ÓÉÓÚ __declspec(align())£¬½á¹¹±»Ìî³ä */
++#pragma warning(disable:4324)     /* disable warning C4324: ï¿½ï¿½ï¿½ï¿½ __declspec(align())ï¿½ï¿½ï¿½á¹¹ï¿½ï¿½ï¿½ï¿½ï¿½ */
+ #endif
+ 
+ /**
+@@ -178,7 +178,7 @@ extern "C" {
+  */
+ /* align a pointer */
+ #  define CACHE_LINE_SIZE       32    /* for x86-64 and x86 */
+-#  define ALIGN_POINTER(p)      (p) = (uint8_t *)((intptr_t)((p) + (CACHE_LINE_SIZE - 1)) & (~(intptr_t)(CACHE_LINE_SIZE - 1)))
++#  define ALIGN_POINTER(p)      (p) = (__typeof__(p))((void *)((intptr_t)((p) + (CACHE_LINE_SIZE - 1)) & (~(intptr_t)(CACHE_LINE_SIZE - 1))))
+ #  define CACHE_LINE_256B       32    /* for x86-64 and x86 */
+ #  define ALIGN_256_PTR(p)      (p) = (uint8_t *)((intptr_t)((p) + (CACHE_LINE_256B - 1)) & (~(intptr_t)(CACHE_LINE_256B - 1)))
+ 

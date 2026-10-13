@@ -1,0 +1,15 @@
+diff --git a/source/decore/com_def.h b/source/decore/com_def.h
+index 8b7ad27..1b14ba1 100644
+--- a/source/decore/com_def.h
++++ b/source/decore/com_def.h
+@@ -37,8 +37,9 @@
+ 
+ #define CHECK_RAND_STRM 0
+ 
++/* [10bit patch] 默认改为 1，让 10bit 流可解（上游默认 0）。 */
+ #ifndef COMPILE_10BIT
+-#define COMPILE_10BIT 0
++#define COMPILE_10BIT 1
+ #endif
+ 
+ #if COMPILE_10BIT

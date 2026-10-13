@@ -1,0 +1,29 @@
+# 构建产物 —— 由 CI 生成，不入库
+artifacts/
+out/
+*.o
+*.so
+*.a
+*.d
+
+# 依赖源码（CI 会自己 clone）
+deps/
+uavs3d-src/
+mpv-android/
+
+# 平台/编辑器
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 例外：探针源码与 patch 要入库
+!probes/
+!patches/
+
+# 探针只留源码；编译出的可执行文件（无扩展名或 .32/.64 后缀）不入库
+probes/*32
+probes/*64
+probes/uavs3dprobe
+probes/davs2probe

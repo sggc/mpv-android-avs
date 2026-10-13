@@ -1,0 +1,313 @@
+name: Build libmpv with CAVS support (Windows)
+
+# 构建 Windows 版 libmpv（带 CAVS Guangdian profile 支持）
+# 使用 sumingyd/FFmpeg fork 替代官方 FFmpeg，通过 mpv-winbuild-cmake 交叉编译
+# 产物上传到 GitHub Release，供 build.yml 下载使用
+#
+# 基础环境选择 ubuntu-22.04（而非 archlinux 容器）：
+# 原因：archlinux 容器宿主 GCC 16.1.1 与 GCC 14 源码存在根本性不兼容
+#       (safe-ctype.h 宏与 C++16 标准库 locale_facets.h 冲突)
+# Ubuntu 22.04 的 GCC 11.x 与 GCC 14 源码完全兼容
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to upload libmpv to (e.g. libmpv-cavs-latest)"
+        required: true
+        default: "libmpv-cavs-latest"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build libmpv with CAVS support
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Setup git config
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory $PWD
+
+      - name: Install build dependencies
+        # 安装 mpv-winbuild-cmake 在 Ubuntu 上的所有依赖（来自官方 README）
+        # 注意：mimalloc 在 Ubuntu 22.04 官方仓库不存在，已移除（可选依赖，不影响构建）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential checkinstall bison flex gettext git \
+            mercurial subversion ninja-build gyp cmake yasm nasm \
+            automake pkgconf libtool libtool-bin gcc-multilib g++-multilib \
+            clang lld libc++1 libc++abi1 \
+            libgmp-dev libmpfr-dev libmpc-dev libgcrypt-dev \
+            gperf ragel texinfo autopoint re2c asciidoc \
+            python3-pip docbook2x unzip p7zip-full curl ccache
+          pip3 install rst2pdf meson mako jsonschema
+
+      - name: Clone mpv-winbuild-cmake
+        run: |
+          git clone --depth 1 https://github.com/shinchiro/mpv-winbuild-cmake.git
+          git config --global --add safe.directory $PWD/mpv-winbuild-cmake
+
+      - name: Patch sources for CAVS and shaderc support
+        # 修补 mpv-winbuild-cmake 的源码配置：
+        # 1. FFmpeg：使用官方 FFmpeg，然后应用 llawsxx/FFmpeg 的 CAVS Guangdian profile 补丁
+        #    只添加 CAVS (AVS1-P16, Guangdian profile) 解码支持，保留所有其他解码器
+        #    (包括 AVS2/libdavs2、AVS3、H.264、H.265 等)
+        #    补丁来源：llawsxx/FFmpeg 的 6 个 CAVS 相关 commits
+        #    - 新增 6 个文件: libcavs.c libcavs.h libcavsdec.c dradec.c dradec.h libdradec.c
+        #    - 修改 6 个配置文件: configure Makefile allcodecs.c codec_desc.c codec_id.h mpegts.c
+        # 2. 禁用 NVENC：nvcodec-headers 中 NV_ENC_CLOCK_TIMESTAMP_SET.countingType 不存在
+        #    CAVS 不依赖 NVENC，禁用不影响 CAVS 支持
+        #    注意：仅将 ffmpeg_cuda 设为空字符串不够，FFmpeg configure 检测到
+        #    nvcodec-headers 后会自动启用 nvenc，必须显式 --disable-nvenc
+        # 3. 禁用 libbluray：libbluray 和 libdvdread 都包含相同的 file_dir_win32.c
+        #    和 file_file_win32.c 源文件，导致 dir_open_default 和 file_open_default
+        #    符号多重定义链接错误。蓝光播放对 IPTV 应用不需要，禁用不影响 CAVS 支持
+        #    注意：必须同时禁用 FFmpeg 和 mpv 的 libbluray，因为两者都默认启用：
+        #    - FFmpeg: --enable-libbluray (packages/ffmpeg.cmake)
+        #    - mpv: -Dlibbluray=enabled (packages/mpv.cmake)
+        #    只禁用 FFmpeg 不够，mpv 仍会通过 pkg-config 找到 libbluray.a 并链接
+        # 4. shaderc 依赖：固定 spirv-headers、spirv-tools、glslang 到兼容版本
+        run: |
+          cd mpv-winbuild-cmake
+          # 1. CAVS 补丁：修改 ffmpeg.cmake 添加 PATCH_COMMAND
+          #    真正的 patch 文件在 Building mpv 步骤中下载并放到 src_packages/cavs_patches
+          #    PATCH_COMMAND 在 SOURCE_DIR (src_packages/ffmpeg) 中执行
+          #    所以用 ../cavs_patches/ 引用 patch 文件
+          #    使用 --batch --forward 选项：忽略已应用的 patch，跳过失败的 hunk
+          #    失败的 hunk 由后续 sed 命令手动修复（例如 codec_id.h 在新 FFmpeg 中行号变化）
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          CAVS_PATCH_CMD=""
+          for sha in $CAVS_PATCHES; do
+            CAVS_PATCH_CMD="${CAVS_PATCH_CMD} && patch -p1 --batch --forward -i ../cavs_patches/${sha}.patch || true"
+          done
+          CAVS_PATCH_CMD="${CAVS_PATCH_CMD# && }"
+          # 手动修复 codec_id.h：在 AV_CODEC_ID_AHX 后添加 AV_CODEC_ID_DRA
+          # d208cf8 patch 中这个 hunk 因官方 FFmpeg 行号变化而失败
+          CAVS_PATCH_CMD="${CAVS_PATCH_CMD} && grep -q AV_CODEC_ID_DRA libavcodec/codec_id.h || sed -i '/AV_CODEC_ID_AHX,/a\\    AV_CODEC_ID_DRA,' libavcodec/codec_id.h"
+          sed -i "/UPDATE_COMMAND \"\"/a\\    PATCH_COMMAND bash -c \"${CAVS_PATCH_CMD}\"" packages/ffmpeg.cmake
+          echo "=== Patched ffmpeg.cmake (CAVS patches injection) ==="
+          grep -A2 "PATCH_COMMAND" packages/ffmpeg.cmake
+          # 2. 禁用 NVENC (NVIDIA 硬件编码器)
+          sed -i 's|set(ffmpeg_cuda "--enable-cuda-llvm --enable-cuvid --enable-nvdec --enable-nvenc")|set(ffmpeg_cuda "--disable-cuda-llvm --disable-cuvid --disable-nvdec --disable-nvenc")|' cmake/packages_check.cmake
+          # 3. 禁用 libbluray 解决与 libdvdread 的符号冲突
+          sed -i 's|--enable-libbluray|--disable-libbluray|' packages/ffmpeg.cmake
+          sed -i 's|-Dlibbluray=enabled|-Dlibbluray=disabled|' packages/mpv.cmake
+          echo "=== Patched ffmpeg.cmake (libbluray) ==="
+          grep -E "libbluray" packages/ffmpeg.cmake
+          echo "=== Patched mpv.cmake (libbluray) ==="
+          grep -E "libbluray" packages/mpv.cmake
+          echo "=== Patched packages_check.cmake (ffmpeg_cuda) ==="
+          grep -E "ffmpeg_cuda" cmake/packages_check.cmake
+          # 4. 固定 spirv-headers、spirv-tools、glslang 到 shaderc DEPS 文件声明的兼容版本
+          sed -i 's|GIT_TAG main|GIT_TAG daa093dd29aab8cbb6562b808370562f56e399fb|' packages/spirv-headers.cmake
+          sed -i '/force_rebuild_git(spirv-headers)/i set_property(TARGET spirv-headers PROPERTY _EP_GIT_RESET "daa093dd29aab8cbb6562b808370562f56e399fb")' packages/spirv-headers.cmake
+          sed -i 's|GIT_TAG main|GIT_TAG d5bbf95d87dd6d2694fbf09acfb42a00c93575e8|' packages/spirv-tools.cmake
+          sed -i '/force_rebuild_git(spirv-tools)/i set_property(TARGET spirv-tools PROPERTY _EP_GIT_RESET "d5bbf95d87dd6d2694fbf09acfb42a00c93575e8")' packages/spirv-tools.cmake
+          sed -i 's|GIT_TAG main|GIT_TAG ce138e2c2d6992b31ff4cd2e955904637785a881|' packages/glslang.cmake
+          sed -i '/force_rebuild_git(glslang)/i set_property(TARGET glslang PROPERTY _EP_GIT_RESET "ce138e2c2d6992b31ff4cd2e955904637785a881")' packages/glslang.cmake
+          echo "=== Patched spirv-headers.cmake ==="
+          grep -E "GIT_TAG|_EP_GIT_RESET" packages/spirv-headers.cmake
+          echo "=== Patched spirv-tools.cmake ==="
+          grep -E "GIT_TAG|_EP_GIT_RESET" packages/spirv-tools.cmake
+          echo "=== Patched glslang.cmake ==="
+          grep -E "GIT_TAG|_EP_GIT_RESET" packages/glslang.cmake
+
+      - name: Loading toolchain cache
+        # 缓存 GCC 交叉编译工具链构建结果，失败也保存（重试可复用源码和配置）
+        uses: actions/cache/restore@v4
+        with:
+          path: mpv-winbuild-cmake/build_x86_64
+          key: gcc-toolchain-x86_64-ubuntu-${{ github.run_id }}
+          restore-keys: |
+            gcc-toolchain-x86_64-ubuntu-
+
+      - name: Loading repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: mpv-winbuild-cmake/src_packages
+          key: repository-x86_64-ubuntu-${{ github.run_id }}
+          restore-keys: |
+            repository-x86_64-ubuntu-
+
+      - name: Loading rustup cache
+        uses: actions/cache/restore@v4
+        with:
+          path: mpv-winbuild-cmake/clang_root
+          key: clang_root-x86_64-ubuntu-${{ github.run_id }}
+          restore-keys: |
+            clang_root-x86_64-ubuntu-
+
+      - name: Downloading source
+        # MAKEJOBS=2 降低 GCC 并行编译度，避免 GitHub Actions runner 内存不足 (OOM)
+        run: |
+          cd mpv-winbuild-cmake
+          cmake -DTARGET_ARCH=x86_64-w64-mingw32 \
+                -DMAKEJOBS=2 \
+                -DSINGLE_SOURCE_LOCATION=$PWD/src_packages \
+                -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup \
+                -DENABLE_CCACHE=ON \
+                --fresh -G Ninja -B build_x86_64 -S $PWD
+          ninja -C build_x86_64 download || true
+
+      - name: Building toolchain (GCC cross-compiler)
+        # 首次构建需要编译 GCC 交叉编译工具链（耗时较长，MAKEJOBS=2 约 40-60 分钟）
+        # Ubuntu 22.04 的 GCC 11.x 与 GCC 14 源码完全兼容，无需任何修补
+        run: |
+          cd mpv-winbuild-cmake
+          if [[ ! -f "build_x86_64/install/bin/cross-gcc" ]]; then
+            ninja -C build_x86_64 gcc || {
+              echo "=== GCC build failed! Diagnostics below ==="
+              echo "=== Disk space ==="
+              df -h
+              echo "=== Memory ==="
+              free -h
+              echo "=== GCC build logs (last 300 lines) ==="
+              find build_x86_64/toolchain -name "gcc-build-*.log" -exec sh -c 'echo "--- {} ---"; tail -300 {}' \;
+              echo "=== GCC configure logs (last 100 lines) ==="
+              find build_x86_64/toolchain -name "gcc-configure-*.log" -exec sh -c 'echo "--- {} ---"; tail -100 {}' \;
+              echo "=== config.log files (last 100 lines) ==="
+              find build_x86_64/toolchain -name "config.log" -exec sh -c 'echo "--- {} ---"; tail -100 {}' \;
+              echo "=== dmesg (OOM killer check) ==="
+              dmesg 2>/dev/null | grep -i "killed process\|out of memory" | tail -20 || echo "Cannot access dmesg"
+              exit 1
+            }
+            # 构建成功后删除 toolchain 目录（保留 install 目录），节省缓存空间
+            rm -rf build_x86_64/toolchain
+          fi
+
+      - name: Saving toolchain cache
+        # 即使构建失败也保存缓存，重试时可复用已下载的源码和配置结果
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: mpv-winbuild-cmake/build_x86_64
+          key: gcc-toolchain-x86_64-ubuntu-${{ github.run_id }}
+
+      - name: Saving repository cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: mpv-winbuild-cmake/src_packages
+          key: repository-x86_64-ubuntu-${{ github.run_id }}
+
+      - name: Saving rustup cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: mpv-winbuild-cmake/clang_root
+          key: clang_root-x86_64-ubuntu-${{ github.run_id }}
+
+      - name: Building mpv with CAVS support
+        # 构建 mpv 及所有依赖（包括 FFmpeg）
+        # 失败时输出所有包的构建日志，便于诊断编译错误
+        run: |
+          cd mpv-winbuild-cmake
+          # 删除 FFmpeg 和 mpv 的 configure/build stamp 文件，强制重新 configure
+          # 原因：修改了 configure 选项（FFmpeg 禁用 libbluray，mpv 禁用 libbluray）
+          # 如果不删除 stamp 文件，ninja 会跳过 configure，使用旧的配置结果
+          rm -f build_x86_64/packages/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-patch
+          rm -f build_x86_64/packages/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-configure
+          rm -f build_x86_64/packages/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-build
+          rm -f build_x86_64/packages/mpv-prefix/src/mpv-stamp/mpv-configure
+          rm -f build_x86_64/packages/mpv-prefix/src/mpv-stamp/mpv-force-meson-configure
+          rm -f build_x86_64/packages/mpv-prefix/src/mpv-stamp/mpv-build
+          # 删除 spirv-headers、spirv-tools、glslang 的 HEAD stamp 文件
+          # 原因：force_rebuild_git 的 reset_head.sh 会检查 HEAD 文件是否存在
+          # 如果 HEAD 文件存在且与 git rev-parse @{u} 匹配，会走 else 分支（git reset --hard -q）
+          # 不会更新到 commit hash。删除 HEAD 文件后，走 if 分支执行 git reset --hard ${reset}
+          rm -f build_x86_64/packages/spirv-headers-prefix/src/spirv-headers-stamp/HEAD
+          rm -f build_x86_64/packages/spirv-tools-prefix/src/spirv-tools-stamp/HEAD
+          rm -f build_x86_64/packages/glslang-prefix/src/glslang-stamp/HEAD
+          ninja -C build_x86_64 update
+          # 在 ninja 构建前下载 CAVS patches 到 src_packages/cavs_patches
+          # PATCH_COMMAND 在 SOURCE_DIR (src_packages/ffmpeg) 中执行，用 ../cavs_patches/ 引用
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          mkdir -p src_packages/cavs_patches
+          for sha in $CAVS_PATCHES; do
+            if [ ! -f "src_packages/cavs_patches/${sha}.patch" ]; then
+              echo "Downloading CAVS patch $sha..."
+              curl -fsSL "https://github.com/llawsxx/FFmpeg/commit/${sha}.patch" \
+                -o "src_packages/cavs_patches/${sha}.patch" || { echo "Failed to download patch $sha"; exit 1; }
+            fi
+          done
+          echo "=== CAVS patches ==="
+          ls -la src_packages/cavs_patches/
+          ninja -C build_x86_64 mpv || {
+            echo "=== mpv build failed! Diagnostics below ==="
+            echo "=== All package build logs (last 200 lines each) ==="
+            find build_x86_64/packages -name "*-build-*.log" -exec sh -c 'echo "--- {} ---"; tail -200 {}' \;
+            echo "=== All package configure logs (last 100 lines each) ==="
+            find build_x86_64/packages -name "*-configure-*.log" -exec sh -c 'echo "--- {} ---"; tail -100 {}' \;
+            echo "=== FFmpeg config.log ==="
+            find build_x86_64/packages/ffmpeg-prefix -name "config.log" -exec sh -c 'echo "--- {} ---"; tail -200 {}' \;
+            echo "=== Disk space ==="
+            df -h
+            echo "=== Memory ==="
+            free -h
+            echo "=== dmesg (OOM killer check) ==="
+            dmesg 2>/dev/null | grep -i "killed process\|out of memory" | tail -20 || echo "Cannot access dmesg"
+            exit 1
+          }
+
+      - name: Packaging mpv
+        run: |
+          cd mpv-winbuild-cmake
+          mkdir -p release_x86_64
+          rm -rf build_x86_64/mpv-debug*
+          ninja -C build_x86_64 mpv-packaging
+          echo "=== Build artifacts ==="
+          ls -la build_x86_64/mpv*.7z
+          # 复制 dev 包并重命名为固定名称，方便 build.yml 下载
+          cp build_x86_64/mpv-dev-x86_64-*.7z release_x86_64/mpv-dev-x86_64-cavs.7z
+          ls -la release_x86_64/
+
+      - name: Verify CAVS support in libmpv
+        # 验证构建产物中确实包含 CAVS Guangdian profile 支持
+        run: |
+          cd mpv-winbuild-cmake
+          echo "=== Extracting libmpv-2.dll for verification ==="
+          7z x release_x86_64/mpv-dev-x86_64-cavs.7z -o/tmp/mpv-dev -y
+          echo "=== libmpv-2.dll info ==="
+          find /tmp/mpv-dev -name "libmpv-2.dll" -ls
+          echo "=== Checking cavs decoder description ==="
+          # libmpv-2.dll 中应包含 "Guangdian" 或 "guangdian" 字符串
+          strings /tmp/mpv-dev/libmpv-2.dll 2>/dev/null | grep -i "guangdian\|JiZhun\|cavs" | head -20 || \
+            echo "WARNING: Could not find CAVS strings in libmpv-2.dll"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-cavs-windows
+          path: mpv-winbuild-cmake/release_x86_64/mpv-dev-x86_64-cavs.7z
+          retention-days: 1
+
+  release:
+    name: Upload to GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: libmpv-cavs-windows
+          path: release
+
+      - name: Upload libmpv to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: release/mpv-dev-x86_64-cavs.7z
+          fail_on_unmatched_files: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

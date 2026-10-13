@@ -1,0 +1,2278 @@
+name: Build libmpv with CAVS/AVS2 support (Android, dynamic, stripped, optimized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. libmpv-cavs-dynamic-latest)"
+        required: true
+        default: "libmpv-cavs-dynamic-latest"
+
+permissions:
+  contents: write
+
+env:
+  MPV_ANDROID_REF: "2026-04-25"
+
+jobs:
+  build:
+    name: Build libmpv ${{ matrix.arch.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { name: arm64-v8a, buildall_arg: arm64 }
+          - { name: armeabi-v7a, buildall_arg: armv7l }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ninja-build pkg-config \
+            nasm yasm python3-pip git autoconf automake libtool \
+            cmake ccache unzip wget curl \
+            libssl-dev zlib1g-dev gperf patchelf
+          sudo pip3 install --upgrade meson mako
+          meson --version
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        # v3 asks the SDK for the legacy "tools" package, which Google has
+        # removed from the repository ("Failed to find package 'tools'" -> exit 1).
+        # v4 no longer installs it.
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android NDK
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "ndk;29.0.14206865" "platform-tools"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Clone mpv-android
+        run: |
+          git clone --depth 1 --branch ${{ env.MPV_ANDROID_REF }} \
+            https://github.com/mpv-android/mpv-android.git
+          cd mpv-android
+          git submodule update --init --recursive || true
+
+      - name: Download CAVS patches
+        run: |
+          mkdir -p cavs_patches
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          for sha in $CAVS_PATCHES; do
+            echo "Downloading CAVS patch $sha..."
+            curl -fsSL "https://github.com/llawsxx/FFmpeg/commit/${sha}.patch" \
+              -o "cavs_patches/${sha}.patch" || { echo "Failed to download patch $sha"; exit 1; }
+          done
+          ls -la cavs_patches/
+
+      - name: Patch buildscripts
+        run: |
+          cd mpv-android/buildscripts
+
+          # === 1. depinfo.sh: add davs2 ===
+          sed -i '/^v_libxml2=/a v_davs2=1.6' include/depinfo.sh
+          sed -i '/^dep_dav1d=/a dep_davs2=()' include/depinfo.sh
+          sed -i 's/dep_ffmpeg=(mbedtls dav1d libxml2)/dep_ffmpeg=(mbedtls dav1d libxml2 davs2)/' include/depinfo.sh
+
+          # === 2. download-deps.sh: add davs2 download ===
+          # Clone WITHOUT --depth 1 so version.sh can use git rev-list
+          sed -i '/\[ ! -d dav1d \] && git clone/a [ ! -d davs2 ] && git clone --branch 1.6 https://github.com/pkuvcl/davs2.git' include/download-deps.sh
+
+          # === 3. Create scripts/davs2.sh ===
+          printf '%s\n' \
+            '#!/bin/bash -e' \
+            '. ../../include/path.sh' \
+            'if [ "$1" == "build" ]; then' \
+            '	true' \
+            'elif [ "$1" == "clean" ]; then' \
+            '	rm -rf _build$ndk_suffix' \
+            '	exit 0' \
+            'else' \
+            '	exit 255' \
+            'fi' \
+            'export CC="$CXX"' \
+            'cd build/linux' \
+            './configure \' \
+            '	--host=$ndk_triple \' \
+            '	--prefix=/ \' \
+            '	--enable-shared \' \
+            '	--disable-static \' \
+            '	--enable-pic \' \
+            '	--disable-asm \' \
+            '	--bit-depth=10' \
+            'make -j$cores lib-shared' \
+            'make DESTDIR="$prefix_dir" install-lib-shared' \
+            '# Fix .pc file: ensure Version field is correct (version.sh may fail with shallow clone)' \
+            'PC_FILE="$prefix_dir/lib/pkgconfig/davs2.pc"' \
+            'if [ -f "$PC_FILE" ]; then' \
+            '    echo "=== davs2.pc before fix ==="' \
+            '    cat "$PC_FILE"' \
+            '    if ! grep -q "^Version: 1" "$PC_FILE"; then' \
+            '        if grep -q "^Version:" "$PC_FILE"; then' \
+            '            sed -i "s/^Version:.*/Version: 1.7.0/" "$PC_FILE"' \
+            '        else' \
+            '            sed -i "/^Name:/a Version: 1.7.0" "$PC_FILE"' \
+            '        fi' \
+            '        echo "=== davs2.pc after fix ==="' \
+            '        cat "$PC_FILE"' \
+            '    fi' \
+            'fi' \
+            'ls -la "$prefix_dir/lib/libdavs2.so"* "$prefix_dir/lib/pkgconfig/davs2.pc" 2>/dev/null || { echo "ERROR: davs2 build failed"; exit 1; }' \
+            > scripts/davs2.sh
+          chmod +x scripts/davs2.sh
+
+          # === 4. Patch ffmpeg.sh ===
+          sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
+          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os --extra-ldflags=-llog/' scripts/ffmpeg.sh
+
+          # === 4c. Decoder list ===
+          # NOTE: --enable-libuavs3d and --enable-libdavs2 are included here
+          # because the brace-expansion sed patches are fragile and may not
+          # match the fork's ffmpeg.sh. FFmpeg configure processes all flags
+          # regardless of order, so placing library flags here is safe.
+          printf '%s\n' \
+            '	--enable-libuavs3d' \
+            '	--enable-libdavs2' \
+            '	--disable-decoders' \
+            '	--enable-decoder=h264,hevc,mpeg1video,mpeg2video,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3' \
+            '	--enable-decoder=h263,h263i,h263p,flv,svq1,svq3,amv' \
+            '	--enable-decoder=vp3,vp5,vp6,vp6a,vp6f,vp7,vp8,vp9,av1' \
+            '	--enable-decoder=cavs,libdav1d,libdavs2,libuavs3d' \
+            '	--enable-decoder=vc1,vc1image,wmv1,wmv2,wmv3,wmv3image' \
+            '	--enable-decoder=theora,dvvideo,rawvideo' \
+            '	--enable-decoder=mjpeg,jpegls,png,prores,ffv1,huffyuv' \
+            '	--enable-decoder=rv10,rv20,rv30,rv40' \
+            '	--enable-decoder=4xm,qtrle,cinepak,msrle,msvideo1,utvideo,indeo3,indeo5' \
+            '	--enable-decoder=zlib,bzlib' \
+            '	--enable-decoder=h264_mediacodec,hevc_mediacodec,mpeg2_mediacodec,mpeg4_mediacodec,vp8_mediacodec,vp9_mediacodec,av1_mediacodec' \
+            '	--enable-decoder=aac,aac_latm,mp3,mp2,mp1,ac3,eac3,dca,flac,opus,vorbis,alac' \
+            '	--enable-decoder=pcm_s16le,pcm_s24le,pcm_s32le,pcm_s16be,pcm_s24be,pcm_s32be' \
+            '	--enable-decoder=pcm_u8,pcm_f32le,pcm_f64le,pcm_s8,pcm_u16le,pcm_u24le,pcm_u32le' \
+            '	--enable-decoder=adpcm_ima_wav,adpcm_ms,adpcm_adx,adpcm_swf,g729' \
+            '	--enable-decoder=wmav1,wmav2,wmapro,wmalossless,wmavoice,cook,ra_144,ra_288,sipr' \
+            '	--enable-decoder=truehd,mlp,atrac3,atrac1,atrac3p' \
+            '	--enable-decoder=amrnb,amrwb,g726,g722' \
+            '	--enable-decoder=tak,tta,ape,shorten,imc' \
+            '	--enable-decoder=av3a' \
+            > /tmp/decoders.txt
+          sed -i '/--disable-{muxers,encoders,devices}/r /tmp/decoders.txt' scripts/ffmpeg.sh
+          echo "=== ffmpeg.sh decoder count ==="
+          grep -c "enable-decoder" scripts/ffmpeg.sh
+
+      - name: Download dependencies
+        run: |
+          cd mpv-android/buildscripts
+          export IN_CI=1
+          # Two layers of protection against intermittent GitHub release 500s:
+          #   1. per-fetch retries (download-sdk.sh / download-deps.sh honour $WGET)
+          #   2. re-run download.sh after dropping the empty deps/<name> dirs a
+          #      failed fetch leaves behind - those would otherwise be skipped by
+          #      the script's own "[ ! -d ]" guard on the next attempt.
+          export WGET="wget --tries=6 --timeout=30 --retry-connrefused"
+          dl_ok=0
+          for attempt in 1 2 3 4 5; do
+            find deps -maxdepth 1 -type d -empty -exec rmdir {} + 2>/dev/null || true
+            if ./download.sh; then
+              dl_ok=1
+              break
+            fi
+            echo "download.sh failed (attempt $attempt/5), retrying in 15s"
+            sleep 15
+          done
+          [ "$dl_ok" = "1" ] || { echo "ERROR: dependency download still failing after 5 attempts"; exit 1; }
+          dl_empty=$(find deps -maxdepth 1 -type d -empty -not -name deps 2>/dev/null || true)
+          [ -z "$dl_empty" ] || { echo "ERROR: dependencies left empty:"; echo "$dl_empty"; exit 1; }
+          echo "=== davs2 source check ==="
+          ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 not found"; exit 1; }
+
+      # ---------------------------------------------------------------------
+      # AVS2 / AVS3 10-bit 支持
+      #
+      # 上游默认两个都是 8bit-only：
+      #   davs2   build/linux/configure 主动 exit 1 拒绝 9/10bit
+      #          （"BitDepth 9/10 not supported currently"），但源码的
+      #          HIGH_BIT_DEPTH 路径其实是完整的，只差 3 处类型处理，见
+      #          patches/davs2-10bit.patch
+      #   uavs3d  source/decore/com_def.h 默认 COMPILE_10BIT 0
+      #
+      # 用 git apply 而不是 sed：上游源码变动时这里会明确报冲突，
+      # 而不是 sed 静默不匹配后构建莫名少/多东西。
+      #
+      # 已真机验证（ATV_S905L3 / armeabi-v7a，见 README）：
+      #   davs2  CCTV4K.AVS2-10bit 3840x2160@50 -> 16 帧, bit_depth=10, err=0
+      #   davs2  8bit 回归 test1/风电 -> 正常出帧, 不退化
+      # ---------------------------------------------------------------------
+      - name: Apply 10-bit patches (davs2 / uavs3d)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          PATCH_DIR="$GITHUB_WORKSPACE/mpv-android-avs/patches"
+          [ -d "$PATCH_DIR" ] || PATCH_DIR="$GITHUB_WORKSPACE/patches"
+
+          apply() {
+            local name="$1" dir="$2" patch="$3"
+            if [ ! -d "$dir" ]; then
+              echo "::warning::$name dir not found: $dir — skipping $patch"
+              return 0
+            fi
+            echo "=== $name: git apply --check $patch ==="
+            if (cd "$dir" && git apply --check "$PATCH_DIR/$patch" 2>&1); then
+              (cd "$dir" && git apply "$PATCH_DIR/$patch")
+              echo "  [OK] $patch applied to $name"
+            elif (cd "$dir" && git apply --reverse --check "$PATCH_DIR/$patch" 2>/dev/null); then
+              echo "  [SKIP] $patch already applied to $name"
+            else
+              echo "::error::$patch does not apply cleanly to $name — upstream changed?"
+              (cd "$dir" && git apply --check "$PATCH_DIR/$patch")
+              exit 1
+            fi
+          }
+
+          # davs2: 放开 configure 闸门 + decoder.cc 强转 + osdep.h 宏
+          DAVS2_DIR=$(find "$GITHUB_WORKSPACE/mpv-android/buildscripts/deps" \
+                        -maxdepth 1 -type d -name davs2 2>/dev/null | head -1)
+          [ -n "$DAVS2_DIR" ] || DAVS2_DIR=$(find "$GITHUB_WORKSPACE" -maxdepth 5 -type d \
+                        -name davs2 -path "*/deps/*" 2>/dev/null | head -1)
+          apply "davs2"  "$DAVS2_DIR" davs2-10bit.patch
+
+          # uavs3d: COMPILE_10BIT 默认 0 -> 1
+          # 该目录由后面的 "Build libuavs3d" step clone 出来，若它先跑则这里已存在；
+          # 若顺序变化（uavs3d 后 clone），本 step 会 warning 跳过，uavs3d 那边
+          # 的 cmake 已带 -DCOMPILE_10BIT=1，不依赖本 patch。
+          UAVS3D_DIR="$GITHUB_WORKSPACE/uavs3d-src"
+          apply "uavs3d" "$UAVS3D_DIR" uavs3d-10bit.patch
+
+      - name: Patch davs2 source — disable threading + NULL safety
+        run: |
+          cd mpv-android/buildscripts
+          DAVS2_DIR=$(find . -type d -name "davs2" | grep -v ".git" | head -1)
+          [ -d "$DAVS2_DIR/source" ] || { echo "ERROR: davs2 source not found"; exit 1; }
+          cd "$DAVS2_DIR"
+
+          echo "=== davs2 source files ==="
+          find source -name "*.cc" -o -name "*.c" | sort
+
+          cat > /tmp/patch_davs2_source.py << 'SCRIPT_EOF'
+          import os, re, sys
+
+          nl = '\n'
+          ok = []
+          fail = []
+
+          # ===== 1. REPLACE ENTIRE threadpool.cc with synchronous implementation =====
+          # THE critical fix — replaces all threadpool functions with synchronous
+          # versions that execute work in the calling thread.
+          # No pthread_create, no worker threads, no race conditions.
+          # API from threadpool.h:
+          #   int  davs2_threadpool_init(p_pool, threads, init_func, init_arg1, init_arg2)
+          #   void davs2_threadpool_run(pool, func, arg1, arg2, wait_sign)
+          #   int  davs2_threadpool_is_free(pool)
+          #   void *davs2_threadpool_wait(pool, arg1, arg2)
+          #   void davs2_threadpool_delete(pool)
+          threadpool_cc = "source/common/threadpool.cc"
+          # davs2_threadpool_wait() returns the finished job's value. The synchronous stub
+          # can only do that if the job typedef really returns void*, so read threadpool.h
+          # instead of assuming it.
+          tp_job_h = "source/common/threadpool.h"
+          tp_job_src = ""
+          if os.path.exists(tp_job_h):
+              with open(tp_job_h, 'r', encoding='latin-1') as f:
+                  tp_job_src = f.read()
+          tp_job_m = re.search(r'typedef\s+([\w\s\*]*?)\s*\(\s*\*\s*davs2_threadpool_func_t\s*\)', tp_job_src)
+          job_returns_ptr = bool(tp_job_m) and '*' in tp_job_m.group(1)
+          print("threadpool job typedef returns void*: %s" % job_returns_ptr)
+          if job_returns_ptr:
+              run_body = ('    g_tp_run++;' + nl +
+                          '    g_sync_result = func ? func(arg1, arg2) : NULL;   /* SYNC_RESULT */' + nl)
+              wait_body = ('    g_tp_wait++;' + nl +
+                           '    {' + nl +
+                           '        void *r = g_sync_result;' + nl +
+                           '        g_sync_result = NULL;' + nl +
+                           '        if (r) g_tp_wait_nonnull++;' + nl +
+                           '        (void)pool; (void)arg1; (void)arg2;' + nl +
+                           '        return r;' + nl +
+                           '    }')
+          else:
+              run_body = '    g_tp_run++;' + nl + '    if (func) func(arg1, arg2);' + nl
+              wait_body = ('    g_tp_wait++;' + nl +
+                           '    (void)g_sync_result; (void)pool; (void)arg1; (void)arg2;' + nl +
+                           '    return NULL;' + nl)
+          # Counters, readable from the FFmpeg wrapper through a weak symbol, because
+          # printf inside libdavs2.so never reaches logcat on Android.
+          # threadpool.cc is C++, so the export MUST be extern "C" - otherwise the symbol
+          # comes out mangled (_Z13davs2_tp_diagPiS_S_S_) and the wrapper's C declaration
+          # resolves to nothing, which is exactly why every tp_* field read -1 last round.
+          tp_diag_src = (
+              '#if defined(__cplusplus)' + nl +
+              'extern "C"' + nl +
+              '#endif' + nl +
+              'int davs2_tp_diag(int *init, int *run, int *wait, int *nonnull) {' + nl +
+              '    if (init) *init = g_tp_init;' + nl +
+              '    if (run) *run = g_tp_run;' + nl +
+              '    if (wait) *wait = g_tp_wait;' + nl +
+              '    if (nonnull) *nonnull = g_tp_wait_nonnull;' + nl +
+              '    return 0;' + nl +
+              '}' + nl)
+
+          if os.path.exists(threadpool_cc):
+              sync_impl = (
+                  '/* FORCE_SYNC_THREADPOOL - replaced by build script */' + nl +
+                  '/* Synchronous implementation - no threads, no pthread_create */' + nl +
+                  '' + nl +
+                  '#ifndef FPFX' + nl +
+                  '#define FPFX(x) davs2_##x' + nl +
+                  '#endif' + nl +
+                  '#include "threadpool.h"' + nl +
+                  '#include <stdlib.h>' + nl +
+                  '#include <string.h>' + nl +
+                  '' + nl +
+                  'struct davs2_threadpool_t { int dummy; };' + nl +
+                  'static void *g_sync_result;   /* SYNC_RESULT: last job return value */' + nl +
+                  'static int g_tp_init, g_tp_run, g_tp_wait, g_tp_wait_nonnull;' + nl +
+                  '' + nl +
+                  'int davs2_threadpool_init(davs2_threadpool_t **p_pool, int threads,' + nl +
+                  '                           davs2_threadpool_func_t init_func,' + nl +
+                  '                           void *init_arg1, int init_arg2) {' + nl +
+                  '    *p_pool = (davs2_threadpool_t *)calloc(1, sizeof(davs2_threadpool_t));' + nl +
+                  '    if (!*p_pool) return -1;' + nl +
+                  '    if (init_func) init_func(init_arg1, init_arg2);' + nl +
+                  '    g_tp_init++;' + nl +
+                  '    return 0;' + nl +
+                  '}' + nl +
+                  '' + nl +
+                  'void davs2_threadpool_run(davs2_threadpool_t *pool,' + nl +
+                  '                           davs2_threadpool_func_t func,' + nl +
+                  '                           void *arg1, int arg2, int wait_sign) {' + nl +
+                  run_body +
+                  '}' + nl +
+                  '' + nl +
+                  'int davs2_threadpool_is_free(davs2_threadpool_t *pool) {' + nl +
+                  '    return 1;' + nl +
+                  '}' + nl +
+                  '' + nl +
+                  'void *davs2_threadpool_wait(davs2_threadpool_t *pool, void *arg1, int arg2) {' + nl +
+                  wait_body +
+                  '}' + nl +
+                  '' + nl +
+                  'void davs2_threadpool_delete(davs2_threadpool_t *pool) {' + nl +
+                  '    if (pool) free(pool);' + nl +
+                  '}' + nl
+              )
+              sync_impl = sync_impl + tp_diag_src
+              with open(threadpool_cc, 'w', encoding='latin-1') as f:
+                  f.write(sync_impl)
+              ok.append("threadpool.cc: REPLACED ENTIRE FILE with sync implementation")
+          else:
+              fail.append(f"NOT FOUND: {threadpool_cc}")
+
+          # ===== 1b. Patch threadpool.h: remove FPFX macro dependencies =====
+          # threadpool.h has macros like:
+          #   #define davs2_threadpool_init FPFX(threadpool_init)
+          # FPFX is defined in davs2.h which our threadpool.cc may not include.
+          # Remove these #define lines so function names are plain identifiers.
+          threadpool_h = "source/common/threadpool.h"
+          if os.path.exists(threadpool_h):
+              with open(threadpool_h, 'r', encoding='latin-1') as f:
+                  h_content = f.read()
+              h_orig = h_content
+              h_content = re.sub(r'#define\s+davs2_threadpool_\w+\s+FPFX\(\w+\)\s*\n', '', h_content)
+              if 'FPFX_REMOVED' not in h_content:
+                  h_content = '/* FPFX_REMOVED */\n' + h_content
+              if h_content != h_orig:
+                  with open(threadpool_h, 'w', encoding='latin-1') as f:
+                      f.write(h_content)
+                  ok.append("threadpool.h: removed FPFX macros + added marker")
+              else:
+                  ok.append("threadpool.h: already patched")
+          else:
+              fail.append(f"NOT FOUND: {threadpool_h}")
+
+          # ===== 2. Patch davs2.cc: force param->threads=1 + NULL guards =====
+          davs2_cc = "source/common/davs2.cc"
+          if os.path.exists(davs2_cc):
+              with open(davs2_cc, 'r', encoding='latin-1') as f:
+                  content = f.read()
+              orig = content
+
+              # 2a. Force param->threads = 1 in davs2_decoder_open
+              if 'FORCE_SINGLE_THREAD_IN_DAVS2' not in content:
+                  idx = content.find('davs2_decoder_open')
+                  if idx >= 0:
+                      brace_idx = content.find('{', idx)
+                      if brace_idx >= 0:
+                          insert_pos = brace_idx + 1
+                          force_line = nl + '    if (param) param->threads = 1; /* FORCE_SINGLE_THREAD_IN_DAVS2 */' + nl
+                          content = content[:insert_pos] + force_line + content[insert_pos:]
+                          ok.append("davs2.cc: force param->threads=1")
+                      else:
+                          fail.append("davs2.cc: no brace after davs2_decoder_open")
+                  else:
+                      fail.append("davs2.cc: davs2_decoder_open not found")
+              else:
+                  ok.append("davs2.cc: already forced param->threads=1")
+
+              # 2b. NULL guards at API entry points
+              api_patches = [
+                  ('int davs2_decoder_send_packet', '    if (!h || !pkt || !pkt->data || pkt->len <= 0) return DAVS2_ERROR;' + nl),
+                  ('int davs2_decoder_recv_frame', '    if (!h) return DAVS2_ERROR;' + nl),
+                  ('int davs2_decoder_flush', '    if (!h) return DAVS2_ERROR;' + nl),
+                  ('void davs2_decoder_close', '    if (!h) return;' + nl),
+              ]
+              for func_sig, guard_line in api_patches:
+                  if guard_line.strip() not in content:
+                      idx = content.find(func_sig)
+                      if idx >= 0:
+                          brace_idx = content.find('{', idx)
+                          if brace_idx >= 0:
+                              insert_pos = brace_idx + 1
+                              content = content[:insert_pos] + nl + guard_line + content[insert_pos:]
+                              ok.append(f"davs2.cc: NULL guard for {func_sig}")
+                      else:
+                          fail.append(f"davs2.cc: {func_sig} not found")
+                  else:
+                      ok.append(f"davs2.cc: {func_sig} already guarded")
+
+              # 2c. Protect destroy_dpb calls
+              content = content.replace(
+                  'destroy_dpb(mgr);',
+                  'if (mgr && mgr->dpb != NULL) destroy_dpb(mgr);'
+              )
+
+              # 2d. DAVS2_DEC_PROBE: count the gates in decoder_decode_picture(). The API only
+              # hands back DAVS2_GOT_FRAME after a picture was dispatched, so if 'dispatched'
+              # stays 0 while 'seen' grows, the picture header parse is what is failing.
+              # Read back through davs2_dec_diag(), same weak-symbol channel that already
+              # delivered the threadpool counters.
+              if 'DAVS2_DEC_PROBE' not in content:
+                  head = ('/* DAVS2_DEC_PROBE: temporary instrumentation, remove after triage */' + nl +
+                          'extern "C" {' + nl +
+                          '    int davs2_dec_probe[4];' + nl +
+                          '    int davs2_dec_diag(int *seen, int *parse_ok, int *dispatched, int *dropped) {' + nl +
+                          '        if (seen) *seen = davs2_dec_probe[3];' + nl +
+                          '        if (parse_ok) *parse_ok = davs2_dec_probe[0];' + nl +
+                          '        if (dispatched) *dispatched = davs2_dec_probe[1];' + nl +
+                          '        if (dropped) *dropped = davs2_dec_probe[2];' + nl +
+                          '        return 0;' + nl +
+                          '    }' + nl +
+                          '}' + nl + nl)
+                  content = head + content
+                  a_parse = '    if (parse_header(h, &es_unit->bs) == 0) {'
+                  a_run = ('            davs2_threadpool_run((davs2_threadpool_t *)mgr->thread_pool, '
+                           'decoder_decode_picture_data, h, 0, 0);')
+                  a_drop = 'task_unload_packet(h, es_unit);'
+                  n_parse = content.count(a_parse)
+                  n_run = content.count(a_run)
+                  # both drop sites; newline-anchored, because the 8-space pattern is also a
+                  # substring of the 12-space line and a naive replace would corrupt it
+                  n_drop = 0
+                  for ind_drop in ('            ', '        '):
+                      pat = nl + ind_drop + a_drop
+                      c = content.count(pat)
+                      n_drop += c
+                      if c:
+                          content = content.replace(pat, nl + ind_drop + 'davs2_dec_probe[2]++;' + pat)
+                  if n_parse == 1 and n_run == 1 and n_drop >= 1:
+                      content = content.replace(a_parse,
+                                                '    davs2_dec_probe[3]++;' + nl + a_parse + nl +
+                                                '        davs2_dec_probe[0]++;', 1)
+                      content = content.replace(a_run, '            davs2_dec_probe[1]++;' + nl + a_run, 1)
+                      ok.append('davs2.cc: DEC_PROBE wired (parse x%d, dispatch x%d, drop x%d)'
+                                % (n_parse, n_run, n_drop))
+                  else:
+                      print('  DEC_PROBE anchors: parse=%d run=%d drop=%d - skipped'
+                            % (n_parse, n_run, n_drop))
+              else:
+                  ok.append('davs2.cc: DEC_PROBE already present')
+
+              if content != orig:
+                  with open(davs2_cc, 'w', encoding='latin-1') as f:
+                      f.write(content)
+                  print(f"  Written: {davs2_cc}")
+
+          # ===== 3. Patch decoder.cc: NULL guards + thread pool safety =====
+          decoder_cc = "source/common/decoder.cc"
+          if os.path.exists(decoder_cc):
+              with open(decoder_cc, 'r', encoding='latin-1') as f:
+                  content = f.read()
+              orig = content
+
+              # 3a. NULL guards
+              for func_sig in ['void decoder_close', 'int decoder_decode_frame', 'int decoder_decode_nal']:
+                  guard = '    if (h == NULL) return -1;' + nl
+                  if func_sig == 'void decoder_close':
+                      guard = '    if (h == NULL) return;' + nl
+                  if guard.strip() not in content:
+                      idx = content.find(func_sig)
+                      if idx >= 0:
+                          brace_idx = content.find('{', idx)
+                          if brace_idx >= 0:
+                              insert_pos = brace_idx + 1
+                              content = content[:insert_pos] + nl + guard + content[insert_pos:]
+                              ok.append(f"decoder.cc: NULL guard for {func_sig}")
+
+              # 3b. Replace threadpool_create calls with NULL (belt-and-suspenders)
+              # This ensures even if threadpool.cc patch fails, decoder won't create threads
+              if 'FORCE_NULL_THREADPOOL' not in content:
+                  content = re.sub(
+                      r'(h->\w*threadpool\w*\s*=\s*)threadpool_create\s*\([^)]*\)\s*;',
+                      r'\1NULL; /* FORCE_NULL_THREADPOOL */',
+                      content
+                  )
+                  if 'FORCE_NULL_THREADPOOL' in content:
+                      ok.append("decoder.cc: threadpool_create calls replaced with NULL")
+
+              if content != orig:
+                  with open(decoder_cc, 'w', encoding='latin-1') as f:
+                      f.write(content)
+                  print(f"  Written: {decoder_cc}")
+
+          # ===== Summary =====
+          print(nl + "=== DAVS2 SOURCE PATCH SUMMARY ===")
+          for p in ok:
+              print(f"  OK:   {p}")
+          for p in fail:
+              print(f"  FAIL: {p}")
+
+          # Verify critical patches
+          critical_checks = [
+              ('threadpool.cc replaced', threadpool_cc, 'FORCE_SYNC_THREADPOOL'),
+              ('threadpool.h patched', threadpool_h, 'FPFX_REMOVED'),
+              ('param->threads forced', davs2_cc, 'FORCE_SINGLE_THREAD_IN_DAVS2'),
+          ]
+          all_critical = True
+          for name, path, marker in critical_checks:
+              if os.path.exists(path):
+                  with open(path, 'r', encoding='latin-1') as f:
+                      v = f.read()
+                  if marker in v:
+                      print(f"  VERIFIED: {name}")
+                  else:
+                      print(f"  NOT VERIFIED: {name}")
+                      all_critical = False
+
+          if not all_critical:
+              print("WARNING: Some critical patches not verified!")
+          print("=== DAVS2 SOURCE PATCH DONE ===")
+          SCRIPT_EOF
+
+          python3 /tmp/patch_davs2_source.py
+
+          echo "=== davs2 patch verification ==="
+          grep -rn "FORCE_SYNC_THREADPOOL\|FORCE_SINGLE_THREAD\|FORCE_NULL_THREADPOOL\|if (!h" source/ 2>/dev/null | head -30
+
+      - name: Patch FFmpeg libdavs2.c wrapper (CRITICAL FIX)
+        run: |
+          cd mpv-android/buildscripts
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          if [ -z "$FFMPEG_DIR" ]; then
+            FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          fi
+          [ -d "$FFMPEG_DIR/libavcodec" ] || { echo "ERROR: no FFmpeg"; exit 1; }
+          LIBDAVS2_C="$FFMPEG_DIR/libavcodec/libdavs2.c"
+          [ -f "$LIBDAVS2_C" ] || { echo "ERROR: libdavs2.c not found"; exit 1; }
+
+          echo "=== Original libdavs2.c key lines ==="
+          grep -n "thread_count\|param.threads\|cad->packet.data\|davs2_decoder_send_packet\|davs2_decoder_recv_frame\|DAVS2_ERROR\|can't read\|buf_ptr" "$LIBDAVS2_C" | head -30
+
+          # Write Python patch script to file (avoids YAML heredoc indentation issues)
+          cat > /tmp/patch_davs2.py << 'SCRIPT_EOF'
+          import sys, os, re
+
+          # Find libdavs2.c
+          file_path = ""
+          for d in ['deps/ffmpeg', 'sources/ffmpeg']:
+              p = os.path.join(d, 'libavcodec', 'libdavs2.c')
+              if os.path.exists(p):
+                  file_path = p
+                  break
+          if not file_path:
+              import subprocess
+              r = subprocess.run(['find', '.', '-name', 'libdavs2.c', '-path', '*/libavcodec/*'],
+                                 capture_output=True, text=True)
+              file_path = r.stdout.strip().split('\n')[0] if r.stdout.strip() else ""
+
+          if not file_path or not os.path.exists(file_path):
+              print("ERROR: libdavs2.c not found")
+              sys.exit(1)
+
+          print(f"Patching: {file_path}")
+          with open(file_path, 'r', encoding='latin-1') as f:
+              content = f.read()
+
+          original = content
+          ok = []
+          fail = []
+
+          # PATCH 1: Force single-threaded (THE CRITICAL FIX)
+          # Actual code: cad->param.threads = avctx->thread_count;
+          # Previous bug: searched for 'davs2_default_read_parameters' which doesn't exist!
+          old_t = 'cad->param.threads = avctx->thread_count;'
+          new_t = 'cad->param.threads = 1; /* FORCE_SINGLE_THREAD: prevent SIGSEGV */'
+          if old_t in content:
+              content = content.replace(old_t, new_t)
+              ok.append("1: Force single-thread (exact match)")
+          elif 'FORCE_SINGLE_THREAD' in content:
+              ok.append("1: Already applied")
+          else:
+              content = re.sub(r'cad->param\.threads\s*=\s*[^;]+;', new_t, content)
+              if 'FORCE_SINGLE_THREAD' in content:
+                  ok.append("1: Force single-thread (regex)")
+              else:
+                  fail.append("1: Cannot find thread line")
+
+          # PATCH 2: Skip corrupt/empty packets + NULL decoder check
+          # Build C code block using string concatenation (YAML-safe)
+          nl = '\n'
+          corrupt_block = (
+              "    /* CRASH_FIX: skip corrupt/empty packets */" + nl +
+              "    if (!buf_ptr || buf_size <= 0) {" + nl +
+              "        *got_frame = 0;" + nl +
+              "        return 0;" + nl +
+              "    }" + nl +
+              "    if (avpkt->flags & AV_PKT_FLAG_CORRUPT) {" + nl +
+              '        av_log(avctx, AV_LOG_WARNING, "Skipping corrupt AVS2 packet\\n");' + nl +
+              "        if (cad->decoder)" + nl +
+              "            davs2_decoder_flush(cad->decoder, &cad->headerset, &cad->out_frame);" + nl +
+              "        *got_frame = 0;" + nl +
+              "        return buf_size;" + nl +
+              "    }" + nl +
+              "    /* NULL_DECODER_CHECK */" + nl +
+              "    if (!cad->decoder) {" + nl +
+              "        *got_frame = 0;" + nl +
+              "        return buf_size;" + nl +
+              "    }" + nl +
+              "    cad->packet.data = buf_ptr;"
+          )
+          old_pkt = '    cad->packet.data = buf_ptr;'
+          if old_pkt in content and 'CRASH_FIX' not in content:
+              content = content.replace(old_pkt, corrupt_block, 1)
+              ok.append("2: Corrupt skip + NULL check")
+          elif 'CRASH_FIX' in content:
+              ok.append("2: Already applied")
+          else:
+              fail.append("2: Cannot find packet.data line")
+
+          # PATCH 3: Make send_packet error non-fatal
+          old_se = (
+              "    if (ret == DAVS2_ERROR) {" + nl +
+              '        av_log(avctx, AV_LOG_ERROR, "Decoder error: can\'t read packet\\n");' + nl +
+              "        return AVERROR_EXTERNAL;" + nl +
+              "    }"
+          )
+          new_se = (
+              "    if (ret == DAVS2_ERROR) {" + nl +
+              '        av_log(avctx, AV_LOG_WARNING, "Decoder warning: can\'t read packet, flushing\\n");' + nl +
+              "        davs2_decoder_flush(cad->decoder, &cad->headerset, &cad->out_frame);" + nl +
+              "        *got_frame = 0;" + nl +
+              "        return buf_size;" + nl +
+              "    }"
+          )
+          if old_se in content:
+              content = content.replace(old_se, new_se, 1)
+              ok.append("3: send_packet non-fatal")
+          elif "can't read packet, flushing" in content:
+              ok.append("3: Already applied")
+          else:
+              fail.append("3: Cannot find send error block")
+
+          # PATCH 4: recv_frame error recovery
+          # IMPORTANT: Do NOT use re.sub for replacement because it processes
+          # escape sequences in the replacement string, turning \\n into a real
+          # newline instead of the literal \n needed for C code.
+          # Instead, use re.search to find the pattern, then str.replace to insert.
+          if 'ERROR_RECOVERY' not in content and 'davs2_decoder_recv_frame' in content:
+              pattern = re.compile(r'ret\s*=\s*davs2_decoder_recv_frame\([^)]+\)\s*;')
+              match = pattern.search(content)
+              if match:
+                  matched_text = match.group(0)
+                  recovery_block = (
+                      "\n    /* ERROR_RECOVERY */" + nl +
+                      "    if (ret == DAVS2_ERROR) {" + nl +
+                      '        av_log(avctx, AV_LOG_WARNING, "davs2 recv_frame error, flushing\\n");' + nl +
+                      "        davs2_decoder_flush(cad->decoder, &cad->headerset, &cad->out_frame);" + nl +
+                      "        *got_frame = 0;" + nl +
+                      "        return buf_size;" + nl +
+                      "    }"
+                  )
+                  content = content.replace(matched_text, matched_text + recovery_block, 1)
+                  if 'ERROR_RECOVERY' in content:
+                      ok.append("4: recv_frame error recovery")
+                  else:
+                      fail.append("4: Cannot patch recv_frame")
+              else:
+                  fail.append("4: Cannot find recv_frame pattern")
+          else:
+              ok.append("4: Already applied or not needed")
+
+          # PATCH 5: Force avctx->thread_count = 1 in davs2_init (belt-and-suspenders)
+          # This ensures FFmpeg itself doesn't try to use multiple threads
+          if 'FORCE_AVCX_THREAD_COUNT_1' not in content:
+              # Find davs2_init function and add avctx->thread_count = 1 at the beginning
+              init_idx = content.find('davs2_init')
+              if init_idx >= 0:
+                  init_brace = content.find('{', init_idx)
+                  if init_brace >= 0:
+                      insert_pos = init_brace + 1
+                      thread_force = (
+                          nl + "    avctx->thread_count = 1; /* FORCE_AVCX_THREAD_COUNT_1 */" + nl
+                      )
+                      content = content[:insert_pos] + thread_force + content[insert_pos:]
+                      ok.append("5: Force avctx->thread_count=1 in davs2_init")
+                  else:
+                      fail.append("5: No brace after davs2_init")
+              else:
+                  # Try alternative function name
+                  for alt_name in ['ff_davs2_init', 'davs2_decoder_init']:
+                      alt_idx = content.find(alt_name)
+                      if alt_idx >= 0:
+                          alt_brace = content.find('{', alt_idx)
+                          if alt_brace >= 0:
+                              insert_pos = alt_brace + 1
+                              thread_force = (
+                                  nl + "    avctx->thread_count = 1; /* FORCE_AVCX_THREAD_COUNT_1 */" + nl
+                              )
+                              content = content[:insert_pos] + thread_force + content[insert_pos:]
+                              ok.append(f"5: Force avctx->thread_count=1 in {alt_name}")
+                              break
+                  else:
+                      fail.append("5: Cannot find davs2_init function")
+          else:
+              ok.append("5: Already applied")
+
+          # PATCH 6: one-shot frame logging. 8-bit AVS2 gives a picture, 10-bit AVS2 stays
+          # black, and neither path logs anything, so this is what tells the two apart in a
+          # single build: is davs2 delivering frames at all, and with what geometry? The
+          # threadpool counters come from the synchronous stub (weak reference, so an
+          # unpatched davs2 just reports -1) and say whether davs2 used the pool at all.
+          # Temporary - remove it once the 10-bit case is understood.
+          diag_anchor = '    int plane = 0;' + nl + '    int line  = 0;' + nl
+          if 'DIAG_AVS2_FRAME' not in content and diag_anchor in content:
+              diag_block = diag_anchor + nl + '''    /* DIAG_AVS2_FRAME: temporary instrumentation, remove after triage */
+              {
+                  extern int davs2_tp_diag(int *, int *, int *, int *) __attribute__((weak));
+                  static int diag_calls = 0;
+                  if (diag_calls < 8) {
+                      int ti = -1, tr = -1, tw = -1, tn = -1;
+                      diag_calls++;
+                      if (&davs2_tp_diag) davs2_tp_diag(&ti, &tr, &tw, &tn);
+                      av_log(avctx, AV_LOG_WARNING,
+                             "[avs2-diag] call=%d ret_type=%d hdr=%p out_bit_depth=%d bps=%d "
+                             "pic=%p type=%d p0=%dx%d/ls%d p1=%dx%d/ls%d p2=%dx%d/ls%d pixfmt=%d "
+                             "tp_init=%d tp_run=%d tp_wait=%d tp_nonnull=%d\\n",
+                             diag_calls, ret_type, (void *)headerset,
+                             headerset ? headerset->output_bit_depth : -1, bytes_per_sample,
+                             (void *)pic, pic ? pic->type : -1,
+                             pic ? pic->widths[0] : -1, pic ? pic->lines[0] : -1,
+                             pic ? pic->strides[0] : -1,
+                             pic ? pic->widths[1] : -1, pic ? pic->lines[1] : -1,
+                             pic ? pic->strides[1] : -1,
+                             pic ? pic->widths[2] : -1, pic ? pic->lines[2] : -1,
+                             pic ? pic->strides[2] : -1,
+                             avctx->pix_fmt, ti, tr, tw, tn);
+                  }
+              }
+          '''
+              content = content.replace(diag_anchor, diag_block, 1)
+              ok.append('6: davs2_dump_frames one-shot av_log')
+          elif 'DIAG_AVS2_FRAME' in content:
+              ok.append('6: Already applied')
+          else:
+              fail.append('6: dump_frames anchor missing (diagnostic skipped, build proceeds)')
+
+          # PATCH 8: count what davs2_decoder_recv_frame() answers per packet, including the
+          # DAVS2_DEFAULT ("nothing yet") returns that never reach davs2_dump_frames. That is
+          # the number we are missing: 10-bit delivered headers but zero frames, and the
+          # wrapper logs nothing for the "no frame" case. Printed numerically on purpose -
+          # no DAVS2_* constant names, so this cannot fail to compile.
+          import re as _re
+          _m = _re.search(r'ret\s*=\s*davs2_decoder_recv_frame\([^)]+\)\s*;', content)
+          if _m and 'DIAG_AVS2_RET' not in content:
+              _txt = _m.group(0)
+              _cnt = _txt + nl + (
+                  '    /* DIAG_AVS2_RET: temporary instrumentation, remove after triage */' + nl +
+                  '    {' + nl +
+                  '        extern int davs2_dec_diag(int *, int *, int *, int *)' + nl +
+                  '            __attribute__((weak));' + nl +
+                  '        static int ret_total = 0;' + nl +
+                  '        static int ret_hist[8];' + nl +
+                  '        int ri = (int)ret & 7;' + nl +
+                  '        int ds = -1, dp = -1, dd = -1, dk = -1;' + nl +
+                  '        ret_total++;' + nl +
+                  '        ret_hist[ri]++;' + nl +
+                  '        if (ret_total <= 6 || (ret_total % 50) == 0) {' + nl +
+                  '            if (&davs2_dec_diag) davs2_dec_diag(&ds, &dp, &dd, &dk);' + nl +
+                  '            av_log(avctx, AV_LOG_WARNING,' + nl +
+                  '                   "[avs2-ret] pkt=%d ret=%d hist[0..6]=%d %d %d %d %d %d %d "' + nl +
+                  '                   "davs2[seen=%d parse_ok=%d dispatched=%d dropped=%d]\\n",' + nl +
+                  '                   ret_total, (int)ret, ret_hist[0], ret_hist[1], ret_hist[2],' + nl +
+                  '                   ret_hist[3], ret_hist[4], ret_hist[5], ret_hist[6],' + nl +
+                  '                   ds, dp, dd, dk);' + nl +
+                  '        }' + nl +
+                  '    }')
+              content = content.replace(_txt, _cnt, 1)
+              ok.append('8: recv_frame return counter')
+          elif 'DIAG_AVS2_RET' in content:
+              ok.append('8: Already applied')
+          else:
+              fail.append('8: recv_frame anchor missing (counter skipped, build proceeds)')
+
+          # Write
+          if content != original:
+              with open(file_path, 'w', encoding='latin-1') as f:
+                  f.write(content)
+              print("=== libdavs2.c PATCHED ===")
+          else:
+              print("=== WARNING: No changes ===")
+
+          for p in ok:
+              print(f"  OK:   {p}")
+          for p in fail:
+              print(f"  FAIL: {p}")
+
+          # Verify
+          with open(file_path, 'r', encoding='latin-1') as f:
+              v = f.read()
+          checks = [
+              ('Single-thread', 'param.threads = 1'),
+              ('Corrupt skip', 'CRASH_FIX'),
+              ('NULL decoder', 'NULL_DECODER_CHECK'),
+              ('Error recovery', 'ERROR_RECOVERY'),
+              ('Flush on send error', "can't read packet, flushing"),
+              ('Force thread_count', 'FORCE_AVCX_THREAD_COUNT_1'),
+          ]
+          all_ok = True
+          for name, marker in checks:
+              if marker in v:
+                  print(f"  OK:   {name}")
+              else:
+                  print(f"  FAIL: {name}")
+                  all_ok = False
+          if not all_ok:
+              print(v[:3000])
+              sys.exit(1)
+          print("=== ALL PATCHES VERIFIED ===")
+          SCRIPT_EOF
+
+          python3 /tmp/patch_davs2.py
+
+          # Force recompilation of libdavs2.c (prevent stale .o cache)
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          if [ -z "$FFMPEG_DIR" ]; then
+            FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          fi
+          if [ -n "$FFMPEG_DIR" ] && [ -f "$FFMPEG_DIR/libavcodec/libdavs2.c" ]; then
+            touch "$FFMPEG_DIR/libavcodec/libdavs2.c"
+            echo "Touched libdavs2.c to force recompilation"
+          fi
+
+      - name: Patch FFmpeg libuavs3d.c wrapper (diagnostic)
+        run: |
+          cd mpv-android/buildscripts
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          if [ -z "$FFMPEG_DIR" ]; then
+            FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          fi
+          LIBUAVS3D_C="$FFMPEG_DIR/libavcodec/libuavs3d.c"
+          [ -f "$LIBUAVS3D_C" ] || { echo "ERROR: libuavs3d.c not found"; exit 1; }
+
+          cat > /tmp/patch_uavs3d.py << 'SCRIPT_EOF'
+          import os
+          import sys
+
+          nl = chr(10)
+          path = os.environ.get('LIBUAVS3D_C', '')
+          if not path or not os.path.exists(path):
+              print('ERROR: libuavs3d.c missing (%r)' % path)
+              sys.exit(1)
+
+          src = open(path, encoding='latin-1').read()
+          if 'DIAG_AVS3_FRAME' in src:
+              print('libuavs3d.c: diagnostic already applied')
+              sys.exit(0)
+
+          anchor = '    *got_frame = h->dec_frame.got_pic;' + nl
+          if anchor not in src:
+              print('FAIL: got_pic anchor not found in libuavs3d.c (diagnostic skipped)')
+              sys.exit(0)
+
+          diag = anchor + '''
+              /* DIAG_AVS3_FRAME: temporary instrumentation, remove after triage */
+              {
+                  static int diag_calls = 0;
+                  if (diag_calls < 8) {
+                      diag_calls++;
+                      av_log(avctx, AV_LOG_WARNING,
+                             "[avs3-diag] call=%d got_pic=%d nal_type=%d bit_depth=%d "
+                             "w0=%d h0=%d frm=%dx%d fmt=%d buf=%d consumed=%d\\n",
+                             diag_calls, h->dec_frame.got_pic, h->dec_frame.nal_type,
+                             h->dec_frame.bit_depth,
+                             h->dec_frame.width[0], h->dec_frame.height[0],
+                             frm->width, frm->height, frm->format, buf_size,
+                             (int)(buf_ptr - buf));
+                  }
+              }
+          '''
+          open(path, 'w', encoding='latin-1').write(src.replace(anchor, diag, 1))
+          print('libuavs3d.c: added one-shot [avs3-diag] probe')
+
+          SCRIPT_EOF
+
+          LIBUAVS3D_C="$LIBUAVS3D_C" python3 /tmp/patch_uavs3d.py
+          touch "$LIBUAVS3D_C"
+
+      - name: Apply CAVS patches to FFmpeg
+        run: |
+          cd mpv-android/buildscripts
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          if [ -z "$FFMPEG_DIR" ]; then
+            FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          fi
+          [ -d "$FFMPEG_DIR/libavcodec" ] || { echo "ERROR: no FFmpeg"; exit 1; }
+          cd "$FFMPEG_DIR"
+
+          PATCHES_DIR="$GITHUB_WORKSPACE/cavs_patches"
+          for sha in d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d; do
+            echo "=== Applying $sha ==="
+            patch -p1 --batch --forward -i "$PATCHES_DIR/${sha}.patch" || true
+          done
+
+          if ! grep -q AV_CODEC_ID_DRA libavcodec/codec_id.h; then
+            if grep -q 'AV_CODEC_ID_AHX,' libavcodec/codec_id.h; then
+              perl -i -pe 's/(AV_CODEC_ID_AHX,)/$1\n    AV_CODEC_ID_DRA,/' libavcodec/codec_id.h
+            elif grep -q 'AV_CODEC_ID_G728,' libavcodec/codec_id.h; then
+              perl -i -pe 's/(AV_CODEC_ID_G728,)/$1\n    AV_CODEC_ID_DRA,/' libavcodec/codec_id.h
+            else
+              echo "ERROR: cannot add DRA"; exit 1
+            fi
+          fi
+          ls -la libavcodec/libcavs* libavcodec/dradec* 2>/dev/null || { echo "ERROR: CAVS patch failed"; exit 1; }
+
+      - name: Patch mediacodecdec.c — delayed init for H.264 without extradata
+        run: |
+          cd mpv-android/buildscripts
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          [ -z "$FFMPEG_DIR" ] && FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          MCD_C="$FFMPEG_DIR/libavcodec/mediacodecdec.c"
+          [ -f "$MCD_C" ] || { echo "ERROR: mediacodecdec.c not found"; exit 1; }
+          echo "=== Patching mediacodecdec.c for delayed init ==="
+
+          cat > /tmp/patch_mcdec.py << 'PYEOF'
+          import os, sys
+
+          # Find mediacodecdec.c
+          candidates = []
+          for root in ["deps/ffmpeg", "sources/ffmpeg"]:
+              p = os.path.join(root, "libavcodec", "mediacodecdec.c")
+              if os.path.exists(p):
+                  candidates.append(p)
+          if not candidates:
+              for root, dirs, files in os.walk("."):
+                  if "mediacodecdec.c" in files and ".git" not in root:
+                      candidates.append(os.path.join(root, "mediacodecdec.c"))
+                      break
+          if not candidates:
+              print("ERROR: mediacodecdec.c not found")
+              sys.exit(1)
+          f = candidates[0]
+          print(f"Patching: {f}")
+
+          with open(f, "r") as fh:
+              src = fh.read()
+
+          NL = chr(10)
+
+          # 1. Add delayed_init field
+          old1 = "    int operating_rate;" + NL + "} MediaCodecH264DecContext;"
+          new1 = "    int operating_rate;" + NL + "    int delayed_init;" + NL + "} MediaCodecH264DecContext;"
+          if old1 not in src:
+              print("ERROR: cannot find operating_rate in struct")
+              sys.exit(1)
+          src = src.replace(old1, new1, 1)
+          print("OK: added delayed_init field")
+
+          # 2. Skip ff_mediacodec_dec_init when extradata is empty
+          old2 = (
+              "    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {" + NL +
+              "        s->ctx = NULL;" + NL +
+              "        goto done;" + NL +
+              "    }"
+          )
+          new2 = (
+              "    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {" + NL +
+              "        /* DELAYED_INIT: configure failed (no valid SPS/PPS in extradata)." + NL +
+              "         * Defer MediaCodec configure until SPS/PPS found in stream data. */" + NL +
+              "        av_log(avctx, AV_LOG_INFO, \"MediaCodec configure failed (ret=%d), deferring until SPS/PPS found in stream\\n\", ret);" + NL +
+              "        s->delayed_init = 1;" + NL +
+              "        ret = 0;" + NL +
+              "        goto done;" + NL +
+              "    }"
+          )
+          if old2 not in src:
+              print("ERROR: cannot find ff_mediacodec_dec_init call")
+              sys.exit(1)
+          src = src.replace(old2, new2, 1)
+          print("OK: added delayed_init skip in decode_init")
+
+          # 3. Add mediacodec_try_delayed_init() function
+          func_lines = [
+              "/* DELAYED_INIT: Scan Annex B data for SPS (type 7) and PPS (type 8). */",
+              "/* Returns 0 on success, AVERROR(EAGAIN) if SPS/PPS not yet found. */",
+              "static int mediacodec_try_delayed_init(AVCodecContext *avctx, MediaCodecH264DecContext *s)",
+              "{",
+              "    int ret;",
+              "    const uint8_t *data;",
+              "    int size;",
+              "    const uint8_t *sps_ptr = NULL, *pps_ptr = NULL;",
+              "    int sps_size = 0, pps_size = 0;",
+              "    int i;",
+              "    FFAMediaFormat *fmt;",
+              "    const char *codec_mime = NULL;",
+              "",
+              "    /* Ensure s->ctx is allocated (might be NULL if init failed early) */",
+              "    if (!s->ctx) {",
+              "        s->ctx = av_mallocz(sizeof(*s->ctx));",
+              "        if (!s->ctx) return AVERROR(ENOMEM);",
+              "        s->ctx->delay_flush = s->delay_flush;",
+              "        s->ctx->use_ndk_codec = s->use_ndk_codec;",
+              "    }",
+              "",
+              "    if (s->buffered_pkt.size <= 0) {",
+              "        ret = ff_decode_get_packet(avctx, &s->buffered_pkt);",
+              "        if (ret < 0)",
+              "            return ret;",
+              "    }",
+              "",
+              "    data = s->buffered_pkt.data;",
+              "    size = s->buffered_pkt.size;",
+              "",
+              "    for (i = 0; i < size - 4; i++) {",
+              "        if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {",
+              "            int nal_type = data[i+4] & 0x1F;",
+              "            int j;",
+              "            for (j = i + 5; j < size - 3; j++) {",
+              "                if (data[j] == 0 && data[j+1] == 0 && data[j+2] == 1)",
+              "                    break;",
+              "            }",
+              "            if (j >= size - 3)",
+              "                j = size;",
+              "            if (nal_type == 7 && !sps_ptr) {",
+              "                sps_ptr = data + i;",
+              "                sps_size = j - i;",
+              "            } else if (nal_type == 8 && !pps_ptr) {",
+              "                pps_ptr = data + i;",
+              "                pps_size = j - i;",
+              "            }",
+              "        }",
+              "    }",
+              "",
+              "    if (!sps_ptr || !pps_ptr) {",
+              "        av_log(avctx, AV_LOG_DEBUG, \"Delayed init: SPS/PPS not found in packet yet, dropping\\n\");",
+              "        av_packet_unref(&s->buffered_pkt);",
+              "        return AVERROR(EAGAIN);",
+              "    }",
+              "",
+              "    av_log(avctx, AV_LOG_INFO, \"Delayed init: found SPS (%d bytes) and PPS (%d bytes)\\n\", sps_size, pps_size);",
+              "",
+              "    switch (avctx->codec_id) {",
+              "    case AV_CODEC_ID_H264:  codec_mime = \"video/avc\";  break;",
+              "    case AV_CODEC_ID_HEVC:  codec_mime = \"video/hevc\"; break;",
+              "    default:",
+              "        av_log(avctx, AV_LOG_ERROR, \"Delayed init: unsupported codec_id\\n\");",
+              "        return AVERROR(EINVAL);",
+              "    }",
+              "",
+              "    fmt = ff_AMediaFormat_new(s->use_ndk_codec);",
+              "    if (!fmt) {",
+              "        av_log(avctx, AV_LOG_ERROR, \"Delayed init: Failed to create media format\\n\");",
+              "        return AVERROR_EXTERNAL;",
+              "    }",
+              "",
+              "    ff_AMediaFormat_setString(fmt, \"mime\", codec_mime);",
+              "    ff_AMediaFormat_setInt32(fmt, \"width\", avctx->width);",
+              "    ff_AMediaFormat_setInt32(fmt, \"height\", avctx->height);",
+              "    ff_AMediaFormat_setBuffer(fmt, \"csd-0\", (void*)sps_ptr, sps_size);",
+              "    ff_AMediaFormat_setBuffer(fmt, \"csd-1\", (void*)pps_ptr, pps_size);",
+              "",
+              "    ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, fmt);",
+              "    ff_AMediaFormat_delete(fmt);",
+              "",
+              "    if (ret < 0) {",
+              "        av_log(avctx, AV_LOG_ERROR, \"Delayed init: MediaCodec configure failed, ret=%d\\n\", ret);",
+              "        s->ctx = NULL;",
+              "        return ret;",
+              "    }",
+              "",
+              "    s->delayed_init = 0;",
+              "    av_log(avctx, AV_LOG_INFO, \"Delayed init: MediaCodec configured successfully, codec=%s\\n\", s->ctx->codec_name);",
+              "    return 0;",
+              "}",
+              "",
+              "",
+          ]
+          delayed_func = NL.join(func_lines)
+
+          # Fuzzy match: find 'mediacodec_receive_frame' then search backwards for 'static'
+          idx = src.find('mediacodec_receive_frame')
+          if idx < 0:
+              print("ERROR: cannot find mediacodec_receive_frame")
+              sys.exit(1)
+          func_start = src.rfind('static', 0, idx)
+          if func_start < 0:
+              print("ERROR: cannot find 'static' before mediacodec_receive_frame")
+              sys.exit(1)
+          src = src[:func_start] + delayed_func + src[func_start:]
+          print("OK: added mediacodec_try_delayed_init function")
+
+          # 4. Call delayed init at beginning of receive_frame
+          # Fuzzy match: find the delay_flush comment or the is_flushing call
+          old4 = "    /* In delay_flush mode, wait until the user has released or rendered all retained frames. */"
+          if old4 in src:
+              new4 = (
+                  "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
+                  "    if (s->delayed_init) {" + NL +
+                  "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
+                  "        if (ret < 0)" + NL +
+                  "            return ret;" + NL +
+                  "    }" + NL +
+                  "" + NL +
+                  "    /* In delay_flush mode, wait until the user has released or rendered all retained frames. */"
+              )
+              src = src.replace(old4, new4, 1)
+              print("OK: added delayed_init call in receive_frame (exact match)")
+          else:
+              # Fallback: find ff_mediacodec_dec_is_flushing and insert before its line
+              idx4 = src.find('ff_mediacodec_dec_is_flushing')
+              if idx4 < 0:
+                  # Fallback 2: find first 'MediaCodecH264DecContext *s =' in receive_frame area
+                  idx4 = src.find('MediaCodecH264DecContext *s = avctx->priv_data;', idx)
+                  if idx4 < 0:
+                      print("ERROR: cannot find insertion point in receive_frame")
+                      sys.exit(1)
+                  # Insert after the priv_data line
+                  line_end4 = src.find(NL, idx4) + 1
+                  insert_code = (
+                      "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
+                      "    if (s->delayed_init) {" + NL +
+                      "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
+                      "        if (ret < 0)" + NL +
+                      "            return ret;" + NL +
+                      "    }" + NL
+                  )
+                  src = src[:line_end4] + insert_code + src[line_end4:]
+                  print("OK: added delayed_init call in receive_frame (fallback after priv_data)")
+              else:
+                  line_start4 = src.rfind(NL, 0, idx4) + 1
+                  insert_code = (
+                      "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
+                      "    if (s->delayed_init) {" + NL +
+                      "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
+                      "        if (ret < 0)" + NL +
+                      "            return ret;" + NL +
+                      "    }" + NL + NL
+                  )
+                  src = src[:line_start4] + insert_code + src[line_start4:]
+                  print("OK: added delayed_init call in receive_frame (before is_flushing)")
+
+          # 5. Patch decode_close
+          # Fuzzy match for decode_close: find 'ff_mediacodec_dec_close(avctx, s->ctx);'
+          close_line = "    ff_mediacodec_dec_close(avctx, s->ctx);"
+          if close_line in src:
+              new_close = (
+                  "    if (s->delayed_init) {" + NL +
+                  "        av_freep(&s->ctx);" + NL +
+                  "    } else {" + NL +
+                  "        ff_mediacodec_dec_close(avctx, s->ctx);" + NL +
+                  "    }"
+              )
+              src = src.replace(close_line, new_close, 1)
+              print("OK: patched decode_close")
+          else:
+              print("WARNING: cannot find decode_close line, skipping")
+
+          # 6. Patch done: label to catch ALL init failures (not just ff_mediacodec_dec_init)
+          # This catches errors from h264_set_extradata() and other early failures
+          close_call = "mediacodec_decode_close(avctx);"
+          idx_done = src.find(close_call)
+          if idx_done >= 0:
+              if_start = src.rfind("if (ret < 0) {", 0, idx_done)
+              ret_pos = src.find("return ret;", idx_done)
+              if if_start >= 0 and ret_pos >= 0:
+                  ret_end = src.find(NL, ret_pos) + 1
+                  new_block = (
+                      "if (ret < 0) {" + NL +
+                      "    /* DELAYED_INIT: catch ALL init failures */" + NL +
+                      "    av_log(avctx, AV_LOG_INFO, \"MediaCodec init failed (ret=%d), deferring until SPS/PPS found in stream\\n\", ret);" + NL +
+                      "    if (s->ctx)" + NL +
+                      "        av_freep(&s->ctx);" + NL +
+                      "    s->delayed_init = 1;" + NL +
+                      "    ret = 0;" + NL +
+                      "}" + NL +
+                      "return ret;"
+                  )
+                  src = src[:if_start] + new_block + src[ret_end:]
+                  print("OK: patched done: label to catch all init failures")
+              else:
+                  print("WARNING: cannot find done: label boundaries, skipping")
+          else:
+              print("WARNING: cannot find mediacodec_decode_close(avctx) call, skipping")
+
+          with open(f, "w") as fh:
+              fh.write(src)
+
+          # Verify
+          with open(f, "r") as fh:
+              verify = fh.read()
+          assert "delayed_init" in verify
+          assert "mediacodec_try_delayed_init" in verify
+          assert "MediaCodec configure failed" in verify
+          assert "Delayed init: found SPS" in verify
+          print("All verifications passed!")
+          PYEOF
+
+          python3 /tmp/patch_mcdec.py
+          echo "=== mediacodecdec.c patch complete ==="
+
+      - name: Build libuavs3d (AVS3 video decoder library)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          echo "=== Cloning uavs3d ==="
+          git clone --depth 1 https://github.com/uavs3/uavs3d.git uavs3d-src
+
+          # Patch: Android/Bionic has pthread built into libc, no -lpthread needed
+          echo "=== Patching uavs3d CMakeLists.txt for Android ==="
+          # Disable find_package(Threads) entirely
+          sed -i 's/find_package(Threads REQUIRED)/#find_package(Threads REQUIRED)/' uavs3d-src/source/CMakeLists.txt
+          # Comment out target_link_libraries with pthread
+          sed -i 's/target_link_libraries(\${LIBNAME} pthread)/#target_link_libraries(\${LIBNAME} pthread)/' uavs3d-src/source/CMakeLists.txt
+          # Remove -lpthread from pkg-config generation
+          sed -i 's/-lpthread//' uavs3d-src/source/CMakeLists.txt
+          # Fix armv7: Android NDK Clang doesn't support -mfloat-abi=hard, use softfp instead
+          sed -i 's/-mfloat-abi=hard/-mfloat-abi=softfp/g' uavs3d-src/source/CMakeLists.txt
+          # CRITICAL FIX for armv7: hand-written ARMv7 assembly uses non-PIC relocations
+          # (R_ARM_ALU_PC_G0) that Android's lld linker rejects in shared libraries.
+          # Force "generic" CPU target so uavs3d uses pure C implementations (no ASM).
+          # This only affects armeabi-v7a; arm64-v8a uses its own arm64 ASM block.
+          sed -i 's/set(UAVS3D_TARGET_CPU "armv7")/set(UAVS3D_TARGET_CPU "generic")/' uavs3d-src/source/CMakeLists.txt
+          # Also disable the test executable build
+          sed -i 's/add_subdirectory(test)/#add_subdirectory(test)/' uavs3d-src/CMakeLists.txt
+          echo "=== Patched CMakeLists.txt ==="
+          grep -n "pthread\|Threads\|mfloat-abi" uavs3d-src/source/CMakeLists.txt || echo "pthread/float-abi patches applied cleanly"
+          echo "=== armv7→generic check ==="
+          grep -n 'UAVS3D_TARGET_CPU' uavs3d-src/source/CMakeLists.txt
+
+          # Determine NDK toolchain paths
+          NDK_TRIPLE=""
+          NDK_CMAKE_TRIPLE=""
+          case "${{ matrix.arch.name }}" in
+            arm64-v8a)    NDK_TRIPLE="aarch64-linux-android"; NDK_CMAKE_TRIPLE="aarch64-linux-android" ;;
+            armeabi-v7a)  NDK_TRIPLE="armv7a-linux-androideabi"; NDK_CMAKE_TRIPLE="armv7a-linux-androideabi" ;;
+          esac
+          NDK_API_LEVEL=21
+          ANDROID_TOOLCHAIN="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+
+          echo "=== Building uavs3d for ${{ matrix.arch.name }} ==="
+
+          # CRITICAL: Create prefix directory with symlinks that buildall.sh expects.
+          # buildall.sh's setup_prefix() only creates usr/local symlinks if prefix dir
+          # doesn't exist yet. Our ninja install creates the dir first, causing
+          # buildall.sh to skip symlink creation. Without these symlinks, meson-based
+          # builds (dav1d, etc.) install pkgconfig files to prefix/usr/local/lib/
+          # instead of prefix/lib/, and FFmpeg configure can't find them.
+          PREFIX_DIR="$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix/${{ matrix.arch.buildall_arg }}"
+          mkdir -p "$PREFIX_DIR/lib/pkgconfig" "$PREFIX_DIR/include"
+          [ -L "$PREFIX_DIR/usr" ] || ln -s . "$PREFIX_DIR/usr"
+          [ -L "$PREFIX_DIR/local" ] || ln -s . "$PREFIX_DIR/local"
+
+          mkdir -p uavs3d-build && cd uavs3d-build
+          cmake -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_TOOLCHAIN" \
+            -DANDROID_ABI="${{ matrix.arch.name }}" \
+            -DANDROID_PLATFORM="android-${NDK_API_LEVEL}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX_DIR" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCOMPILE_10BIT=1 \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            ../uavs3d-src
+          ninja -j$(nproc)
+          ninja install
+
+          echo "=== uavs3d installed ==="
+          PREFIX_DIR="$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix/${{ matrix.arch.buildall_arg }}"
+          ls -la "$PREFIX_DIR/lib/"*uavs3d* 2>/dev/null
+          ls -la "$PREFIX_DIR/include/"*uavs3* 2>/dev/null || ls -la "$PREFIX_DIR/include/uavs3d/" 2>/dev/null || true
+
+          # ALWAYS force-fix uavs3d.pc — CMake may generate one with wrong
+          # version (from git rev-list on shallow clone) or with -lpthread
+          # (which doesn't exist on Android). Overwrite unconditionally.
+          PC_FILE="$PREFIX_DIR/lib/pkgconfig/uavs3d.pc"
+          mkdir -p "$PREFIX_DIR/lib/pkgconfig"
+
+          # Determine correct include path for uavs3d headers
+          UAVS3D_INC_DIR="-I\${includedir}"
+          if [ -f "$PREFIX_DIR/include/uavs3d/uavs3d.h" ] && [ ! -f "$PREFIX_DIR/include/uavs3d.h" ]; then
+            cp "$PREFIX_DIR/include/uavs3d/uavs3d.h" "$PREFIX_DIR/include/uavs3d.h" 2>/dev/null || true
+          fi
+
+          echo "=== Force-writing uavs3d.pc (prefix path, no -lpthread, version from source) ==="
+          # 版本不再手写 1.2.1：那样会把 uavs3d 锁死在旧版，连 8bit 流的
+          # NAL 类型 0xB2 都报 ERR_UNKNOWN_NAL（1.2.89 已修）。
+          # 从源码 version.h 取真实版本；取不到再退回 CMakeLists 的 option 默认。
+          UAVS3D_VER="$(sed -n 's/.*VERSION_STR[[:space:]]*"\([^"]*\)".*/\1/p' \
+                        "$GITHUB_WORKSPACE/uavs3d-src/version.h" 2>/dev/null | head -1)"
+          [ -n "$UAVS3D_VER" ] || UAVS3D_VER="1.2.89"
+          printf 'prefix=%s\nexec_prefix=${prefix}\nlibdir=${exec_prefix}/lib\nincludedir=${prefix}/include\n\nName: uavs3d\nDescription: AVS3 decoder library\nVersion: %s\nLibs: -L${libdir} -luavs3d -lm\nCflags: -I${includedir}\n' "$PREFIX_DIR" "$UAVS3D_VER" > "$PC_FILE"
+          echo "uavs3d version in .pc: $UAVS3D_VER"
+          echo "Final uavs3d.pc:"
+          cat "$PC_FILE"
+
+          # Verify: no -lpthread in .pc file
+          if grep -q "lpthread" "$PC_FILE"; then
+            echo "ERROR: -lpthread still in uavs3d.pc!"
+            sed -i 's/ -lpthread//g' "$PC_FILE"
+            echo "Fixed uavs3d.pc:"
+            cat "$PC_FILE"
+          fi
+
+      - name: Verify ffmpeg.sh has libuavs3d and libdavs2 flags
+        run: |
+          cd mpv-android/buildscripts
+          echo "=== Checking ffmpeg.sh for libuavs3d ==="
+          grep -n "libuavs3d" scripts/ffmpeg.sh || { echo "ERROR: libuavs3d not found in ffmpeg.sh!"; exit 1; }
+          echo "=== Checking ffmpeg.sh for libdavs2 ==="
+          grep -n "libdavs2" scripts/ffmpeg.sh || { echo "WARNING: libdavs2 not found in ffmpeg.sh, trying to add it"; }
+          echo "=== All enable- flags in ffmpeg.sh ==="
+          grep -n 'enable-' scripts/ffmpeg.sh
+
+      - name: Download AV3A decoder library and patch FFmpeg
+        run: |
+          cd mpv-android/buildscripts
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          if [ -z "$FFMPEG_DIR" ]; then
+            FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          fi
+          [ -d "$FFMPEG_DIR/libavcodec" ] || { echo "ERROR: no FFmpeg"; exit 1; }
+
+          echo "=== Step 1: Download prebuilt libavs3a_decoder.so ==="
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p av3a-libs
+          case "${{ matrix.arch.name }}" in
+            arm64-v8a)
+              curl -fsSL "https://github.com/wuxianlin/ijkplayer-av3a/raw/master/ijkplayer-java/jniLibs/arm64-v8a/libavs3a_decoder.so" \
+                -o av3a-libs/libavs3a_decoder.so
+              ;;
+            armeabi-v7a)
+              curl -fsSL "https://github.com/wuxianlin/ijkplayer-av3a/raw/master/ijkplayer-java/jniLibs/armeabi-v7a/libavs3a_decoder.so" \
+                -o av3a-libs/libavs3a_decoder.so
+              ;;
+          esac
+          ls -lh av3a-libs/libavs3a_decoder.so || { echo "ERROR: Failed to download libavs3a_decoder.so"; exit 1; }
+
+          # Download model.bin (neural network model needed by AV3A decoder at runtime)
+          curl -fsSL "https://github.com/wuxianlin/ijkplayer-av3a/raw/master/ijkplayer-example/src/main/assets/model.bin" \
+            -o av3a-libs/model.bin || echo "WARNING: model.bin not downloaded"
+          ls -lh av3a-libs/model.bin 2>/dev/null || true
+
+          echo "=== Step 1b: Inspect libavs3a_decoder.so symbols ==="
+          NM_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          if [ -f "$NM_TOOL" ]; then
+            echo "--- Dynamic symbols ---"
+            "$NM_TOOL" -D av3a-libs/libavs3a_decoder.so 2>/dev/null | grep -iE "Avs3(Alloc|Decode|Destroy|Parse)" || echo "(no matching symbols)"
+            echo "--- All exported symbols ---"
+            "$NM_TOOL" -D av3a-libs/libavs3a_decoder.so 2>/dev/null | head -50
+          else
+            echo "nm tool not found, skipping symbol inspection"
+          fi
+
+          echo "=== Step 2: Patch FFmpeg to add AV3A codec support ==="
+          cd "$GITHUB_WORKSPACE/mpv-android/buildscripts"
+          FFMPEG_ABS=$(cd "$FFMPEG_DIR" && pwd)
+          echo "FFmpeg dir: $FFMPEG_ABS"
+
+          # 3a. Write av3a_dec.c (FFmpeg AVCodec wrapper)
+          cp "$GITHUB_WORKSPACE/av3a_dec.c" "$FFMPEG_ABS/libavcodec/av3a_dec.c"
+          echo "Copied av3a_dec.c to libavcodec/"
+
+          # 3b. Add AV_CODEC_ID_AV3A to codec_id.h
+          CODEC_ID_H="$FFMPEG_ABS/libavcodec/codec_id.h"
+          if ! grep -q "AV_CODEC_ID_AV3A" "$CODEC_ID_H"; then
+            if grep -q "AV_CODEC_ID_DRA" "$CODEC_ID_H"; then
+              sed -i '/AV_CODEC_ID_DRA/a\    AV_CODEC_ID_AV3A,' "$CODEC_ID_H"
+            elif grep -q 'AV_CODEC_ID_AHX,' "$CODEC_ID_H"; then
+              sed -i '/AV_CODEC_ID_AHX,/a\    AV_CODEC_ID_AV3A,' "$CODEC_ID_H"
+            else
+              echo "WARNING: Cannot find insertion point in codec_id.h, adding at end of audio section"
+              sed -i '/AV_CODEC_ID_G728,/i\    AV_CODEC_ID_AV3A,' "$CODEC_ID_H"
+            fi
+            echo "Added AV_CODEC_ID_AV3A to codec_id.h"
+          else
+            echo "AV_CODEC_ID_AV3A already in codec_id.h"
+          fi
+          grep -n "AV_CODEC_ID_AV3A" "$CODEC_ID_H" || { echo "ERROR: Failed to add AV_CODEC_ID_AV3A"; exit 1; }
+
+          # 3c. Register decoder in allcodecs.c
+          # In FFmpeg n8.0, allcodecs.c only has extern declarations.
+          # The codec array is auto-generated in codec_list.c by configure.
+          # We only add the extern declaration; configure will discover it
+          # and --enable-decoder=av3a will add it to codec_list.c.
+          ALLCODECS_C="$FFMPEG_ABS/libavcodec/allcodecs.c"
+          echo "=== allcodecs.c before patching ==="
+          head -20 "$ALLCODECS_C"
+          echo "=== Searching for insertion point ==="
+          grep -n 'ff_aac_decoder' "$ALLCODECS_C" || echo "ff_aac_decoder not found"
+          grep -n 'extern.*FFCodec.*ff_.*_decoder' "$ALLCODECS_C" | head -5
+          if ! grep -q "ff_av3a_decoder" "$ALLCODECS_C"; then
+            # Try multiple patterns to handle different FFmpeg versions
+            # Pattern 1: exact match (most common)
+            if grep -q 'extern const FFCodec ff_aac_decoder;' "$ALLCODECS_C"; then
+              sed -i '/extern const FFCodec ff_aac_decoder;/a extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
+              echo "Added extern ff_av3a_decoder after ff_aac_decoder (pattern 1)"
+            # Pattern 2: any aac decoder extern (handles spacing differences)
+            elif grep -q 'extern.*ff_aac.*decoder;' "$ALLCODECS_C"; then
+              sed -i '/extern.*ff_aac.*decoder;/a extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
+              echo "Added extern ff_av3a_decoder after ff_aac decoder (pattern 2)"
+            # Pattern 3: any decoder extern at all (use awk to avoid multi-line sed issues)
+            elif grep -q 'extern.*FFCodec.*ff_.*_decoder;' "$ALLCODECS_C"; then
+              awk '/extern.*FFCodec.*ff_.*_decoder;/{print; print "extern const FFCodec ff_av3a_decoder;"; next}1' "$ALLCODECS_C" > "$ALLCODECS_C.tmp" && mv "$ALLCODECS_C.tmp" "$ALLCODECS_C"
+              echo "Added extern ff_av3a_decoder after first decoder extern (pattern 3)"
+            # Pattern 4: last resort, insert at top of file after includes
+            else
+              echo "WARNING: No decoder extern found in allcodecs.c, inserting at top"
+              sed -i '1i extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
+            fi
+          else
+            echo "ff_av3a_decoder already in allcodecs.c"
+          fi
+          # CRITICAL: Verify the extern was actually added
+          if ! grep -q 'ff_av3a_decoder' "$ALLCODECS_C"; then
+            echo "FATAL: Failed to add ff_av3a_decoder to allcodecs.c!"
+            echo "=== allcodecs.c contents (first 30 lines) ==="
+            head -30 "$ALLCODECS_C"
+            exit 1
+          fi
+          echo "=== allcodecs.c after patching ==="
+          grep -n "av3a" "$ALLCODECS_C"
+
+          # 3c-bis: Patch ffmpeg.sh to patch codec_list.c after configure
+          # Even if allcodecs.c patching works, the configure script might not
+          # pick up the new extern. As a FAILSAFE, we insert a post-configure
+          # step in ffmpeg.sh that directly patches codec_list.c.
+          echo "=== Patching ffmpeg.sh to add codec_list.c post-configure patch ==="
+          FFMPEG_SH="$GITHUB_WORKSPACE/mpv-android/buildscripts/scripts/ffmpeg.sh"
+          # Write the codec_list.c FAILSAFE patch to a script file
+          echo '#!/bin/bash' > /tmp/av3a_cl_patch.sh
+          echo '# AV3A FAILSAFE: Patch codec_list.c to ensure ff_av3a_decoder is registered' >> /tmp/av3a_cl_patch.sh
+          echo 'if [ -f libavcodec/codec_list.c ] && ! grep -q ff_av3a_decoder libavcodec/codec_list.c; then' >> /tmp/av3a_cl_patch.sh
+          echo "    sed -i 's/\\(const FFCodec \\* const codec_list\\[\\] = {\\)/\\1\\n    \\&ff_av3a_decoder,/' libavcodec/codec_list.c" >> /tmp/av3a_cl_patch.sh
+          echo "    echo 'PATCHED codec_list.c to add ff_av3a_decoder (FAILSAFE)'" >> /tmp/av3a_cl_patch.sh
+          echo "    grep -n av3a libavcodec/codec_list.c || echo 'WARNING: av3a still not in codec_list.c!'" >> /tmp/av3a_cl_patch.sh
+          echo 'elif [ -f libavcodec/codec_list.c ]; then' >> /tmp/av3a_cl_patch.sh
+          echo "    echo 'codec_list.c already has ff_av3a_decoder'" >> /tmp/av3a_cl_patch.sh
+          echo 'else' >> /tmp/av3a_cl_patch.sh
+          echo "    echo 'WARNING: codec_list.c not found, cannot patch'" >> /tmp/av3a_cl_patch.sh
+          echo 'fi' >> /tmp/av3a_cl_patch.sh
+          chmod +x /tmp/av3a_cl_patch.sh
+          echo "=== Patch script contents ==="
+          cat /tmp/av3a_cl_patch.sh
+          # Insert 'source /tmp/av3a_cl_patch.sh' before the first 'make' line in ffmpeg.sh
+          # Use awk to find the first line starting with 'make' and insert before it
+          awk '/^[[:space:]]*make/ && !done {print "    source /tmp/av3a_cl_patch.sh"; done=1} {print}' "$FFMPEG_SH" > "$FFMPEG_SH.tmp" && mv "$FFMPEG_SH.tmp" "$FFMPEG_SH"
+          chmod +x "$FFMPEG_SH"
+          echo "=== ffmpeg.sh after patching (make section) ==="
+          grep -n -A2 -B2 "av3a_cl_patch\|make" "$FFMPEG_SH" | head -20
+
+          # 3d. Add to Makefile
+          MAKEFILE="$FFMPEG_ABS/libavcodec/Makefile"
+          if ! grep -q "av3a_dec" "$MAKEFILE"; then
+            echo "OBJS-\$(CONFIG_AV3A_DECODER)            += av3a_dec.o" >> "$MAKEFILE"
+            echo "Added av3a_dec.o to Makefile"
+          fi
+          grep "av3a" "$MAKEFILE"
+
+          # 3e. Add FourCC tag mapping for MPEG-TS demuxer
+          # The MPEG-TS demuxer resolves codec tags via ff_codec_wav_tags in libavformat/riff.c
+          # AV3A FourCC = 'a','v','3','a' = 0x61337661
+          RIFF_C="$FFMPEG_ABS/libavformat/riff.c"
+          if [ -f "$RIFF_C" ] && ! grep -q "AV_CODEC_ID_AV3A" "$RIFF_C"; then
+            # Use hex value directly to avoid quoting issues with MKTAG macro
+            perl -i -pe 's/(\{ AV_CODEC_ID_PCM_S16LE,)/    { AV_CODEC_ID_AV3A,         0x61337661 },\n$1/' "$RIFF_C"
+            echo "Added AV3A FourCC tag to riff.c"
+            grep "AV3A" "$RIFF_C"
+          elif [ -f "$RIFF_C" ]; then
+            echo "AV3A tag already in riff.c"
+          fi
+          # Also patch mpegts.c: map AV3A registration descriptor tag to AV_CODEC_ID_AV3A
+          # The MPEG-TS demuxer parses registration descriptors (tag 0x05) and sets
+          # codec_tag, but does NOT automatically map it to a codec_id.
+          # Without this patch, the stream shows as "Unknown: none (av3a / 0x61337661)"
+          # and no decoder is selected.
+          #
+          # CRITICAL: MPEG-TS does not carry sample_rate or channel count for AV3A.
+          # FFmpeg's avcodec_open2() rejects audio codecs with sample_rate <= 0
+          # BEFORE calling the decoder's init function. So we MUST set sensible
+          # defaults here to allow the codec to be opened. The decoder will later
+          # probe the actual values from the bitstream in av3a_decode_init().
+          MPEGTS_C="$FFMPEG_ABS/libavformat/mpegts.c"
+          if [ -f "$MPEGTS_C" ] && ! grep -q "AV_CODEC_ID_AV3A" "$MPEGTS_C"; then
+            echo "Patching mpegts.c to add AV3A registration descriptor mapping..."
+            # Find the line where codec_tag is set from the registration descriptor
+            # and add AV3A tag mapping after it. Use line-number based insertion.
+            # The registration descriptor handler sets: st->codecpar->codec_tag = bytestream_get_le32(&p);
+            TAG_LINE=$(grep -n 'codec_tag.*bytestream_get_le32' "$MPEGTS_C" | head -1 | cut -d: -f1)
+            if [ -n "$TAG_LINE" ]; then
+              echo "Found codec_tag assignment at line $TAG_LINE, inserting AV3A mapping..."
+              sed -i "${TAG_LINE}a\\
+                      if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; st->codecpar->ch_layout.order = AV_CHANNEL_ORDER_NATIVE; st->codecpar->ch_layout.nb_channels = 2; st->codecpar->ch_layout.u.mask = 0x03; }" "$MPEGTS_C"
+            else
+              echo "WARNING: Could not find codec_tag assignment in mpegts.c, trying alternative pattern..."
+              # Try alternative: search for registration_descriptor comment
+              REG_LINE=$(grep -n 'registration_descriptor' "$MPEGTS_C" | head -1 | cut -d: -f1)
+              if [ -n "$REG_LINE" ]; then
+                echo "Found registration_descriptor at line $REG_LINE, inserting AV3A mapping after case block..."
+                # Insert after the case line — the next lines will contain the codec_tag assignment
+                # We add a fallback that checks for the tag after the case block
+                  sed -i "${REG_LINE}a\\
+                      { if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; st->codecpar->ch_layout.order = AV_CHANNEL_ORDER_NATIVE; st->codecpar->ch_layout.nb_channels = 2; st->codecpar->ch_layout.u.mask = 0x03; } }" "$MPEGTS_C"
+              fi
+            fi
+            if grep -q "AV_CODEC_ID_AV3A" "$MPEGTS_C"; then
+              echo "✓ Successfully patched mpegts.c with AV3A registration descriptor mapping (with default sample_rate=48000, stereo)"
+              grep -n "AV3A" "$MPEGTS_C"
+            else
+              echo "ERROR: Failed to patch mpegts.c with AV3A mapping!"
+              echo "This will cause AV3A audio to not be recognized in MPEG-TS streams."
+            fi
+          elif [ -f "$MPEGTS_C" ]; then
+            echo "AV3A mapping already present in mpegts.c"
+            # Check if sample_rate default is already set, if not add it
+            if ! grep -q "sample_rate.*48000.*AV3A\|AV3A.*sample_rate.*48000" "$MPEGTS_C"; then
+              echo "Adding sample_rate default to existing AV3A mapping..."
+              sed -i 's/st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; }/st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; st->codecpar->ch_layout.order = AV_CHANNEL_ORDER_NATIVE; st->codecpar->ch_layout.nb_channels = 2; st->codecpar->ch_layout.u.mask = 0x03; }/g' "$MPEGTS_C"
+              grep -n "AV3A" "$MPEGTS_C"
+            fi
+          fi
+
+          # 3e2. Patch decode.c: allow AV3A to open with sample_rate=0
+          # FFmpeg's ff_decode_preinit() (in libavcodec/decode.c) or avcodec_open2()
+          # (in libavcodec/avcodec.c) rejects audio codecs with sample_rate <= 0.
+          # This happens BEFORE the decoder's init() is called, so our av3a_decode_init()
+          # never gets a chance to set the sample_rate. We insert a default for AV3A
+          # before the check so the codec can be opened.
+          echo "=== Patching decode.c/avcodec.c for AV3A sample_rate default ==="
+          for DECODE_SRC in "$FFMPEG_ABS/libavcodec/decode.c" "$FFMPEG_ABS/libavcodec/avcodec.c"; do
+            if [ -f "$DECODE_SRC" ] && grep -q "Invalid sample rate" "$DECODE_SRC" && ! grep -q "AV_CODEC_ID_AV3A" "$DECODE_SRC"; then
+              echo "Found 'Invalid sample rate' check in $DECODE_SRC"
+              # Find the line with "Invalid sample rate" and look backwards for the if condition
+              ERR_LINE=$(grep -n "Invalid sample rate" "$DECODE_SRC" | head -1 | cut -d: -f1)
+              echo "Error message at line $ERR_LINE, searching for if condition..."
+              FOUND=0
+              for offset in 1 2 3 4; do
+                CHECK_LINE=$((ERR_LINE - offset))
+                [ "$CHECK_LINE" -lt 1 ] && break
+                LINE_CONTENT=$(sed -n "${CHECK_LINE}p" "$DECODE_SRC")
+                if echo "$LINE_CONTENT" | grep -qE 'if.*sample_rate'; then
+                  echo "Found sample_rate check at line $CHECK_LINE: $LINE_CONTENT"
+                  # Insert a default before the if line
+                  sed -i "${CHECK_LINE}i\\
+                          if (avctx->codec_id == AV_CODEC_ID_AV3A \&\& avctx->sample_rate <= 0) avctx->sample_rate = 48000;" "$DECODE_SRC"
+                  echo "✓ Inserted AV3A default sample_rate before check"
+                  FOUND=1
+                  break
+                fi
+              done
+              if [ "$FOUND" -eq 0 ]; then
+                echo "WARNING: Could not find if condition for sample_rate check, trying direct replacement..."
+                # Fallback: directly modify the condition
+                sed -i 's/avctx->sample_rate <= 0)/avctx->sample_rate <= 0 \&\& avctx->codec_id != AV_CODEC_ID_AV3A)/g' "$DECODE_SRC"
+                echo "Applied direct condition modification"
+              fi
+              # Verify
+              if grep -q "AV_CODEC_ID_AV3A" "$DECODE_SRC"; then
+                echo "✓ Successfully patched $DECODE_SRC for AV3A sample_rate"
+                grep -n "AV3A" "$DECODE_SRC"
+              else
+                echo "ERROR: Failed to patch $DECODE_SRC"
+              fi
+            elif [ -f "$DECODE_SRC" ] && grep -q "AV_CODEC_ID_AV3A" "$DECODE_SRC"; then
+              echo "AV3A patch already present in $DECODE_SRC"
+            fi
+          done
+
+          # 3f. Add the AVCodecDescriptor entry for AV3A. This is required, not optional:
+          # without it avctx->codec_descriptor is NULL and ff_decode_preinit() dereferences
+          # it -> SIGSEGV the moment AV3A opens. avcodec_descriptor_get() bsearches the
+          # table, so the entry has to land at its numerically correct position. The old
+          # perl anchor (AV_CODEC_ID_FIRST_SUBTITLE) does not exist in codec_desc.c at all,
+          # so nothing was ever inserted and the step only printed a WARNING.
+          CODEC_DESC_C="$FFMPEG_ABS/libavcodec/codec_desc.c"
+          if [ -f "$CODEC_DESC_C" ] && ! grep -q "AV_CODEC_ID_AV3A" "$CODEC_DESC_C"; then
+            cat > /tmp/patch_codec_desc.py << 'DESC_EOF'
+          import os
+          import re
+          import sys
+
+          # Insert an AVCodecDescriptor for AV3A into libavcodec/codec_desc.c.
+          #
+          # avcodec_descriptor_get() binary-searches codec_descriptors[], so the new entry has to
+          # sit at its numerically correct position. That position is derived from the
+          # already-patched codec_id.h (AV3A was injected into the middle of the audio
+          # block, which shifts every later implicit id by one), never from a section
+          # comment. Any failure is fatal on purpose: without the entry
+          # avctx->codec_descriptor stays NULL and ff_decode_preinit() dereferences it.
+
+          desc_path = os.environ.get('CODEC_DESC_C', '')
+          id_path = os.environ.get('CODEC_ID_H', '')
+
+          if not (os.path.exists(desc_path) and os.path.exists(id_path)):
+              print('FATAL: codec_desc.c or codec_id.h missing (%r %r)' % (desc_path, id_path))
+              sys.exit(1)
+
+          desc = open(desc_path, encoding='utf-8', errors='replace').read()
+          hdr = open(id_path, encoding='utf-8', errors='replace').read()
+
+
+          def parse_enum(text):
+              start = text.index('enum AVCodecID {')
+              body = text[start + len('enum AVCodecID {'):]
+              body = body[:body.index('\n};')]
+              body = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
+              body = re.sub(r'//[^\n]*', '', body)
+              vals = {}
+              auto = -1
+              for tok in body.split(','):
+                  m = re.match(r'\s*(AV_CODEC_ID_\w+)\s*(?:=\s*(.+?))?\s*$', tok, re.S)
+                  if not m:
+                      continue
+                  name, expr = m.group(1), (m.group(2) or '').strip()
+                  if expr:
+                      e = re.match(r'^(AV_CODEC_ID_\w+|0x[0-9a-fA-F]+|\d+)(?:\s*\+\s*(\d+))?$', expr)
+                      if not e:
+                          continue
+                      base = e.group(1)
+                      if base.startswith('0x'):
+                          val = int(base, 16)
+                      elif base.startswith('AV_CODEC_ID'):
+                          val = vals[base]
+                      else:
+                          val = int(base)
+                      if e.group(2):
+                          val += int(e.group(2))
+                  else:
+                      val = auto + 1
+                  vals[name] = val
+                  auto = val
+              return vals
+
+
+          vals = parse_enum(hdr)
+          if 'AV_CODEC_ID_AV3A' not in vals:
+              print('FATAL: AV_CODEC_ID_AV3A is not in codec_id.h, cannot place its descriptor')
+              sys.exit(1)
+
+          target = vals['AV_CODEC_ID_AV3A']
+          print('AV_CODEC_ID_AV3A resolves to 0x%x' % target)
+
+          table = re.search(r'static const AVCodecDescriptor (\w+)\[\] = \{', desc)
+          if not table:
+              print('FATAL: descriptor table declaration not found in codec_desc.c')
+              sys.exit(1)
+
+          insert_at = None
+          prev = None
+          for m in re.finditer(r'\.id\s*=\s*(AV_CODEC_ID_\w+)', desc):
+              name = m.group(1)
+              val = vals.get(name)
+              if val is None:
+                  continue
+              if val > target:
+                  brace = desc.rfind('{', 0, m.start())
+                  insert_at = desc.rfind('\n', 0, brace) + 1
+                  print('inserting before %s (0x%x), after %s (0x%x)'
+                        % (name, val, prev, vals.get(prev, -1)))
+                  break
+              prev = name
+
+          if insert_at is None:
+              print('FATAL: no descriptor entry with an id above 0x%x - refusing to append'
+                    % target)
+              sys.exit(1)
+
+          entry = (
+              '    {\n'
+              '        .id         = AV_CODEC_ID_AV3A,\n'
+              '        .type       = AVMEDIA_TYPE_AUDIO,\n'
+              '        .name       = "av3a",\n'
+              '        .long_name  = NULL_IF_CONFIG_SMALL("AVS3-P3 Audio Vivid (AV3A)"),\n'
+              '        .props      = AV_CODEC_PROP_LOSSY,\n'
+              '    },\n'
+          )
+
+          out = desc[:insert_at] + entry + desc[insert_at:]
+          open(desc_path, 'w', encoding='utf-8').write(out)
+
+
+          def ids_of(text):
+              return [vals[n] for n in re.findall(r'\.id\s*=\s*(AV_CODEC_ID_\w+)', text) if n in vals]
+
+
+          after = ids_of(out)
+          if 'AV_CODEC_ID_AV3A' not in out:
+              print('FATAL: entry did not make it into the file')
+              sys.exit(1)
+          if after != sorted(after):
+              print('FATAL: codec_descriptors[] is no longer sorted by id - bsearch would break')
+              sys.exit(1)
+          print('OK: %d descriptor entries, strictly ascending, AV3A included' % len(after))
+          DESC_EOF
+            CODEC_DESC_C="$CODEC_DESC_C" CODEC_ID_H="$CODEC_ID_H" python3 /tmp/patch_codec_desc.py
+          else
+            echo "AV3A codec descriptor already present, or codec_desc.c not found"
+          fi
+          # Hard gate: a missing entry means a crash when AV3A opens, and an unsorted table
+          # would break descriptor lookup for every codec. Fail the build instead of shipping
+          # either.
+          [ -f "$CODEC_DESC_C" ] || { echo "FATAL: $CODEC_DESC_C not found"; exit 1; }
+          grep -q "AV_CODEC_ID_AV3A" "$CODEC_DESC_C" || { echo "FATAL: AV3A codec descriptor missing"; exit 1; }
+          echo "=== AV3A codec descriptor context ==="
+          grep -n -B4 -A8 "AV_CODEC_ID_AV3A" "$CODEC_DESC_C"
+
+          echo "=== Step 4: Update ffmpeg.sh to enable AV3A decoder ==="
+          cd "$GITHUB_WORKSPACE/mpv-android/buildscripts"
+          # Add av3a to the audio decoder list
+          if ! grep -q "av3a" scripts/ffmpeg.sh; then
+            sed -i 's/vorbis,alac/vorbis,alac,av3a/' scripts/ffmpeg.sh
+          fi
+          # No ldflags changes needed — av3a_dec.c uses dlopen/dlsym at runtime
+          echo "=== ffmpeg.sh AV3A configuration ==="
+          grep -n "av3a" scripts/ffmpeg.sh
+
+          echo "=== Step 5: Verify avs3 decoder is enabled ==="
+          if grep -q "avs3" scripts/ffmpeg.sh; then
+            echo "✓ avs3 decoder is enabled in ffmpeg.sh"
+            grep "avs3" scripts/ffmpeg.sh
+          else
+            echo "⚠ WARNING: avs3 decoder NOT found in ffmpeg.sh!"
+            echo "Current decoder list:"
+            grep "enable-decoder" scripts/ffmpeg.sh | head -20
+          fi
+
+          echo "=== AV3A support integration complete ==="
+
+      - name: Verify dependencies before FFmpeg build
+        run: |
+          cd mpv-android/buildscripts
+          PREFIX_DIR=""
+          for d in "prefix/${{ matrix.arch.buildall_arg }}" "prefix/arm64" "prefix/armv7l"; do
+            if [ -d "$d/lib" ]; then
+              PREFIX_DIR="$d"
+              break
+            fi
+          done
+          [ -z "$PREFIX_DIR" ] && { echo "ERROR: prefix dir not found"; exit 1; }
+          echo "=== Prefix: $PREFIX_DIR ==="
+          echo "=== pkg-config files ==="
+          ls -la "$PREFIX_DIR/lib/pkgconfig/"*.pc 2>/dev/null || echo "No .pc files found!"
+          echo "=== dav1d check ==="
+          if [ -f "$PREFIX_DIR/lib/pkgconfig/dav1d.pc" ]; then
+            cat "$PREFIX_DIR/lib/pkgconfig/dav1d.pc"
+          else
+            echo "NOTE: dav1d.pc not found yet — dav1d is built by buildall.sh later, this is expected."
+          fi
+          echo "=== uavs3d check ==="
+          if [ -f "$PREFIX_DIR/lib/pkgconfig/uavs3d.pc" ]; then
+            cat "$PREFIX_DIR/lib/pkgconfig/uavs3d.pc"
+          else
+            echo "WARNING: uavs3d.pc not found"
+          fi
+          echo "=== All .so files in prefix ==="
+          ls -la "$PREFIX_DIR/lib/"*.so* 2>/dev/null || echo "No .so files"
+
+      - name: Patch buildall.sh for pthread support
+        run: |
+          cd mpv-android/buildscripts
+          # Android Bionic libc has pthread functions (pthread_create, etc.)
+          # built directly into libc.so — there is no separate libpthread.so.
+          # Meson's dependency('threads') in cross-compilation may fail because:
+          # 1. It tries -lpthread which doesn't exist on Android
+          # 2. The crossfile.txt generated by buildall.sh's setup_prefix()
+          #    does not have a [properties] section to tell meson that
+          #    pthread_create is available in libc
+          #
+          # This causes FFmpeg's UDP circular buffer to be disabled:
+          #   "udp: 'circular_buffer_size' option was set but it is not
+          #    supported on this build (pthread support is required)"
+          #
+          # Fix: Patch buildall.sh's setup_prefix() function to add
+          # [properties] section with has_function_pthread_create = true
+          # in the crossfile.txt it generates.
+          # This tells meson that pthread is available (in libc) without
+          # needing -lpthread.
+          #
+          # NOTE: mpv's meson.build does NOT have a -Dpthread option.
+          # Threads are auto-detected via dependency('threads').
+          # So we must NOT pass -Dpthread=enabled (it will cause meson error).
+
+          BUILDALL_SH="buildall.sh"
+          if [ ! -f "$BUILDALL_SH" ]; then
+            echo "ERROR: buildall.sh not found"
+            exit 1
+          fi
+
+          # Patch setup_prefix() to add [properties] section in crossfile
+          if ! grep -q "has_function_pthread_create" "$BUILDALL_SH"; then
+            # Insert [properties] section before [host_machine] in the crossfile template
+            sed -i '/^\[host_machine\]/i\[properties]\nhas_function_pthread_create = true\n' "$BUILDALL_SH"
+            echo "=== Patched buildall.sh to add [properties] to crossfile.txt ==="
+          else
+            echo "=== buildall.sh already patched ==="
+          fi
+
+          # Verify the patch
+          echo "=== Verifying buildall.sh patch ==="
+          grep -A2 "\[properties\]" "$BUILDALL_SH" || echo "WARNING: [properties] not found in buildall.sh"
+
+          echo "=== buildall.sh setup_prefix crossfile section ==="
+          sed -n '/cat >"\$prefix_dir\/crossfile.tmp"/,/CROSSFILE/p' "$BUILDALL_SH"
+
+      - name: Build libmpv
+        run: |
+          cd mpv-android/buildscripts
+          export IN_CI=1
+
+          # Verify crossfile.txt will have pthread support
+          # (buildall.sh's setup_prefix() was patched in previous step)
+          PREFIX_DIR="prefix/${{ matrix.arch.buildall_arg }}"
+
+          ./buildall.sh --arch ${{ matrix.arch.buildall_arg }} mpv
+
+          # Verify pthread was detected in meson logs
+          echo "=== Checking if pthread was detected ==="
+          BUILD_DIR=$(find . -path "*/mpv/_build*" -type d 2>/dev/null | head -1)
+          if [ -n "$BUILD_DIR" ]; then
+            echo "Found mpv build dir: $BUILD_DIR"
+            # Check meson logs for threads/pthread
+            if [ -f "$BUILD_DIR/meson-logs/meson-log.txt" ]; then
+              echo "=== meson-log.txt pthread entries ==="
+              grep -i "pthread\|threads" "$BUILD_DIR/meson-logs/meson-log.txt" | head -20 || echo "(no pthread mentions in meson log)"
+            fi
+            # Check if crossfile.txt has [properties] section
+            CF="$PREFIX_DIR/crossfile.txt"
+            if [ -f "$CF" ]; then
+              echo "=== crossfile.txt contents ==="
+              cat "$CF"
+            fi
+          fi
+
+          # buildall.sh can exit 0 without producing anything usable, and both steps after it
+          # used to "pass" when they found no output. Assert the libraries really exist.
+          for req in libmpv.so libavcodec.so libavformat.so libavutil.so libavfilter.so; do
+            if [ ! -f "$PREFIX_DIR/lib/$req" ]; then
+              echo "ERROR: buildall.sh finished but $PREFIX_DIR/lib/$req is missing"
+              ls -la "$PREFIX_DIR/lib" 2>/dev/null || echo "(no $PREFIX_DIR/lib at all)"
+              exit 1
+            fi
+          done
+          echo "=== build outputs in $PREFIX_DIR/lib ==="
+          ls -la "$PREFIX_DIR/lib"/*.so
+          find . -name "*.so" -ls 2>/dev/null || true
+
+      - name: Verify decoder support in built libavcodec.so
+        run: |
+          cd mpv-android/buildscripts
+          PREFIX_LIB=""
+          for d in "prefix/${{ matrix.arch.buildall_arg }}/lib" "prefix/arm64/lib" "prefix/armv7l/lib"; do
+            if [ -d "$d" ] && ls "$d"/*.so 1>/dev/null 2>&1; then
+              PREFIX_LIB="$d"
+              break
+            fi
+          done
+          if [ -z "$PREFIX_LIB" ]; then
+            echo "ERROR: no prefix lib dir found - the build produced nothing"
+            exit 1
+          fi
+          AVCODEC_SO="$PREFIX_LIB/libavcodec.so"
+          [ -f "$AVCODEC_SO" ] || { echo "ERROR: $AVCODEC_SO missing - nothing was built"; exit 1; }
+
+          # Find FFmpeg source dir for config.h verification
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -f "$c/ffbuild/config.mak" ] && FFMPEG_DIR="$c" && break
+          done
+
+          echo "=== Verifying AVS3 decoder via FFmpeg config.h ==="
+          CONFIG_H=""
+          if [ -n "$FFMPEG_DIR" ]; then
+            # FFmpeg generates config.h in the build dir or source dir
+            for f in "$FFMPEG_DIR/config.h" "$FFMPEG_DIR/ffbuild/config.h"; do
+              [ -f "$f" ] && CONFIG_H="$f" && break
+            done
+          fi
+          if [ -n "$CONFIG_H" ]; then
+            echo "Checking $CONFIG_H"
+            if grep -q "CONFIG_LIBUVS3D_DECODER 1" "$CONFIG_H"; then
+              echo "✓ CONFIG_LIBUVS3D_DECODER=1 — AVS3 decoder is enabled"
+            else
+              echo "ERROR: CONFIG_LIBUVS3D_DECODER is NOT 1 in config.h!"
+              echo "=== Dumping uavs3d lines from config.h ==="
+              grep -i "uavs3d\|avs3" "$CONFIG_H" || echo "(no uavs3d/avs3 lines found)"
+              echo "=== Dumping config.log for uavs3d ==="
+              if [ -f "$FFMPEG_DIR/ffbuild/config.log" ]; then
+                grep -i "uavs3d\|libuavs3d" "$FFMPEG_DIR/ffbuild/config.log" | tail -20
+              fi
+              exit 1
+            fi
+          else
+            echo "WARNING: config.h not found, falling back to binary check"
+            if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "uavs3d" || strings "$AVCODEC_SO" | grep -i "libuavs3d_decoder\|ff_libuavs3d"; then
+              echo "✓ libuavs3d decoder symbol found"
+            else
+              echo "ERROR: libuavs3d decoder NOT found!"
+              exit 1
+            fi
+          fi
+          echo "--- av3a decoder ---"
+          if [ -n "$CONFIG_H" ]; then
+            if grep -q "CONFIG_AV3A_DECODER 1" "$CONFIG_H"; then
+              echo "✓ CONFIG_AV3A_DECODER=1 — AV3A decoder is enabled"
+            else
+              echo "ERROR: CONFIG_AV3A_DECODER is NOT 1 in config.h!"
+              echo "=== Dumping av3a lines from config.h ==="
+              grep -i "av3a" "$CONFIG_H" || echo "(no av3a lines found in config.h)"
+              echo "=== Checking allcodecs.c for av3a ==="
+              grep -i "av3a" "$FFMPEG_DIR/libavcodec/allcodecs.c" || echo "(no av3a in allcodecs.c)"
+              echo "=== Checking Makefile for av3a ==="
+              grep -i "av3a" "$FFMPEG_DIR/libavcodec/Makefile" || echo "(no av3a in Makefile)"
+              echo "=== Checking ffmpeg.sh for av3a decoder ==="
+              grep -i "av3a" scripts/ffmpeg.sh || echo "(no av3a in ffmpeg.sh)"
+              exit 1
+            fi
+          else
+            if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "av3a" || strings "$AVCODEC_SO" | grep -i "ff_av3a_decoder"; then
+              echo "✓ av3a decoder symbol found"
+            else
+              echo "ERROR: av3a decoder NOT found!"
+              exit 1
+            fi
+          fi
+          # CRITICAL: Check that ff_av3a_decoder is actually in codec_list.c
+          # CONFIG_AV3A_DECODER=1 alone is NOT enough — the codec must be
+          # registered in codec_list[] for avcodec_find_decoder() to find it.
+          echo "=== Checking codec_list.c for ff_av3a_decoder ==="
+          CODEC_LIST_C=""
+          if [ -n "$FFMPEG_DIR" ]; then
+            for f in "$FFMPEG_DIR/libavcodec/codec_list.c" "$FFMPEG_DIR/ffbuild/codec_list.c"; do
+              [ -f "$f" ] && CODEC_LIST_C="$f" && break
+            done
+          fi
+          if [ -n "$CODEC_LIST_C" ]; then
+            echo "Checking $CODEC_LIST_C"
+            if grep -q "ff_av3a_decoder" "$CODEC_LIST_C"; then
+              echo "✓ ff_av3a_decoder IS in codec_list.c — decoder will be registered"
+            else
+              echo "FATAL: ff_av3a_decoder is NOT in codec_list.c!"
+              echo "=== codec_list.c contents (audio decoders section) ==="
+              grep -n "decoder" "$CODEC_LIST_C" | head -40
+              echo "=== allcodecs.c av3a check ==="
+              grep -n "av3a" "$FFMPEG_DIR/libavcodec/allcodecs.c" || echo "(no av3a in allcodecs.c)"
+              exit 1
+            fi
+          else
+            echo "WARNING: codec_list.c not found, skipping check"
+          fi
+          # CRITICAL: Check that the AV3A codec name string is in the binary
+          # Note: --enable-small causes NULL_IF_CONFIG_SMALL() to return NULL,
+          # so the long_name "AVS3-P3 Audio Vivid (AV3A)" is NOT compiled in.
+          # Instead, check for the .name field "av3a" which is always present,
+          # or the ff_av3a_decoder symbol.
+          echo "=== Checking libavcodec.so for AV3A codec strings ==="
+          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -q "ff_av3a_decoder" || strings "$AVCODEC_SO" | grep -q "av3a"; then
+            echo "✓ AV3A decoder found in libavcodec.so (ff_av3a_decoder symbol or av3a string present)"
+          else
+            echo "FATAL: AV3A decoder NOT found in libavcodec.so!"
+            echo "This means ff_av3a_decoder was stripped from the binary."
+            echo "The codec_list.c patching did not work."
+            strings "$AVCODEC_SO" | grep -i "av3a" || echo "(no av3a strings at all)"
+            exit 1
+          fi
+          echo "--- cavs decoder ---"
+          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "cavs" || strings "$AVCODEC_SO" | grep -i "cavs"; then
+            echo "✓ cavs decoder found in libavcodec.so"
+          else
+            echo "⚠ WARNING: cavs decoder NOT found in libavcodec.so!"
+          fi
+          echo "--- davs2 decoder ---"
+          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "davs2" || strings "$AVCODEC_SO" | grep -i "davs2"; then
+            echo "✓ davs2 decoder found in libavcodec.so"
+          else
+            echo "⚠ WARNING: davs2 decoder NOT found in libavcodec.so!"
+          fi
+
+      - name: Collect and strip all .so files
+        run: |
+          cd mpv-android/buildscripts
+          mkdir -p "artifacts/${{ matrix.arch.name }}"
+          STRIP_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+
+          PREFIX_LIB=""
+          for d in "prefix/${{ matrix.arch.buildall_arg }}/lib" "prefix/arm64/lib" "prefix/armv7l/lib"; do
+            if [ -d "$d" ] && ls "$d"/*.so 1>/dev/null 2>&1; then
+              PREFIX_LIB="$d"
+              break
+            fi
+          done
+
+          if [ -z "$PREFIX_LIB" ]; then
+            echo "ERROR: no .so files found in prefix"
+            find . -name "*.so" -ls | head -30
+            exit 1
+          fi
+
+          echo "=== Collecting .so from $PREFIX_LIB ==="
+          for so in "$PREFIX_LIB"/*.so; do
+            [ -f "$so" ] || continue
+            base=$(basename "$so")
+            echo "--- $base ---"
+            echo "Before strip: $(ls -lh "$so" | awk '{print $5}')"
+            if [ -f "$STRIP_TOOL" ]; then
+              "$STRIP_TOOL" --strip-all "$so" 2>/dev/null || true
+              echo "After strip:  $(ls -lh "$so" | awk '{print $5}')"
+            fi
+            cp -L "$so" "artifacts/${{ matrix.arch.name }}/"
+          done
+
+          if [ -f "$PREFIX_LIB/libdavs2.so" ]; then
+            echo "libdavs2.so collected"
+          else
+            echo "WARNING: libdavs2.so not found in $PREFIX_LIB"
+            find . -name "libdavs2.so" -ls 2>/dev/null || true
+          fi
+
+          # === Copy AV3A decoder .so and model.bin ===
+          if [ -f "$GITHUB_WORKSPACE/av3a-libs/libavs3a_decoder.so" ]; then
+            cp "$GITHUB_WORKSPACE/av3a-libs/libavs3a_decoder.so" "artifacts/${{ matrix.arch.name }}/"
+            echo "Copied libavs3a_decoder.so to artifacts"
+          else
+            echo "WARNING: libavs3a_decoder.so not found!"
+          fi
+          if [ -f "$GITHUB_WORKSPACE/av3a-libs/model.bin" ]; then
+            mkdir -p "artifacts/${{ matrix.arch.name }}/assets"
+            cp "$GITHUB_WORKSPACE/av3a-libs/model.bin" "artifacts/${{ matrix.arch.name }}/assets/model.bin"
+            echo "Copied AV3A model.bin to artifacts"
+          else
+            echo "Note: model.bin not found"
+          fi
+
+          # === Fix versioned SONAME in libdavs2.so ===
+          DAVS2_SO="artifacts/${{ matrix.arch.name }}/libdavs2.so"
+          AVCODEC_SO="artifacts/${{ matrix.arch.name }}/libavcodec.so"
+          if [ -f "$DAVS2_SO" ]; then
+            OLD_SONAME=$(patchelf --print-soname "$DAVS2_SO" 2>/dev/null || echo "")
+            echo "libdavs2.so current SONAME: '$OLD_SONAME'"
+            if [ "$OLD_SONAME" != "libdavs2.so" ]; then
+              patchelf --set-soname libdavs2.so "$DAVS2_SO"
+              echo "Patched libdavs2.so SONAME -> libdavs2.so"
+            fi
+          fi
+          if [ -f "$AVCODEC_SO" ]; then
+            NEEDED=$(patchelf --print-needed "$AVCODEC_SO" 2>/dev/null | grep davs2 || echo "")
+            echo "libavcodec.so davs2 NEEDED: '$NEEDED'"
+            if echo "$NEEDED" | grep -q "libdavs2.so.16"; then
+              patchelf --replace-needed libdavs2.so.16 libdavs2.so "$AVCODEC_SO"
+              echo "Patched libavcodec.so NEEDED: libdavs2.so.16 -> libdavs2.so"
+            fi
+          fi
+
+          # === Fix libuavs3d.so SONAME if needed ===
+          UAVS3D_SO="artifacts/${{ matrix.arch.name }}/libuavs3d.so"
+          if [ -f "$UAVS3D_SO" ]; then
+            OLD_SONAME=$(patchelf --print-soname "$UAVS3D_SO" 2>/dev/null || echo "")
+            echo "libuavs3d.so current SONAME: '$OLD_SONAME'"
+            if [ "$OLD_SONAME" != "libuavs3d.so" ]; then
+              patchelf --set-soname libuavs3d.so "$UAVS3D_SO"
+              echo "Patched libuavs3d.so SONAME -> libuavs3d.so"
+            fi
+          else
+            echo "WARNING: libuavs3d.so not found in artifacts!"
+            find "$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix" -name "*uavs3d*" -ls 2>/dev/null || true
+          fi
+
+          echo "=== Final artifacts ==="
+          ls -lh "artifacts/${{ matrix.arch.name }}/"
+          echo "=== SONAME/NEEDED verification ==="
+          for so in "artifacts/${{ matrix.arch.name }}"/*.so; do
+            base=$(basename "$so")
+            soname=$(patchelf --print-soname "$so" 2>/dev/null || echo "N/A")
+            needed=$(patchelf --print-needed "$so" 2>/dev/null | grep davs2 || echo "")
+            echo "  $base: SONAME=$soname  davs2_NEEDED=$needed"
+          done
+
+      # ---------------------------------------------------------------------
+      # 位深自检：10bit 开关是否真的编进去了
+      #
+      # davs2 把位深编进了版本串后缀 —— ".8" 是 8bit、".10" 是 10bit（见
+      # source/davs2.cc 里 davs2_get_version 的格式化）。这是最省事的判据：
+      # 不用反编译、不用真机，构建时就能拦住回退。
+      # ---------------------------------------------------------------------
+      - name: Verify 10-bit support built in
+        run: |
+          ABI_DIR="artifacts/${{ matrix.arch.name }}"
+          fail=0
+
+          # ---------------------------------------------------------------
+          # 判据都是实测+源码双重确认过的，改之前先看 patches/README.md
+          #
+          # davs2：源码 source/common/header.cc 的
+          #        #if HIGH_BIT_DEPTH / #else(davs2_log "Un-supported bit-depth") / #endif
+          #        说明该报错串只存在于 8bit 构建 → 有它 = 8bit(FAIL)，没有 = 10bit(OK)
+          #
+          #        不要用版本串后缀判位深：运行时日志里 "…ef9a…10" 的 ".10" 是
+          #        printf %d 参数运行时拼的，.rodata 里 strings 抓不到。
+          #
+          # uavs3d：无静态判据（COMPILE_10BIT 是编译期宏，10bit 分支无字符串
+          #        字面量，导出符号与 8bit 完全一致）→ 只报信息，
+          #        功能验证靠 probes/uavs3dprobe。
+          # ---------------------------------------------------------------
+          for so in "$ABI_DIR/libdavs2.so" "$ABI_DIR/libuavs3d.so"; do
+            [ -f "$so" ] || { echo "::warning::$so not found"; continue; }
+            base=$(basename "$so")
+            echo "=== $base ==="
+
+            if [ "$base" = "libdavs2.so" ]; then
+              n=$(strings "$so" 2>/dev/null | grep -c "Un-supported bit-depth")
+              if [ "$n" -gt 0 ]; then
+                echo "  [FAIL] 检出 8bit 标志串 \"Un-supported bit-depth\""
+                echo "         --bit-depth=10 或 patches/davs2-10bit.patch 未生效"
+                fail=1
+              else
+                echo "  [OK]   无 8bit 标志串 → 判定 10bit davs2"
+              fi
+
+              # 附带提示：浅克隆会让 version.sh 算不出 patch 号（仅影响版本号）
+              vs=$(strings "$so" 2>/dev/null | grep -oE '1\.[0-9]+\. [0-9a-f]{8,40}' | head -1)
+              if [ -n "$vs" ]; then
+                echo "  [warn] 版本串 '$vs' 缺 patch 号（浅克隆所致）；"
+                echo "         CI 用全克隆应为 '1.6.206 <hash>'。不影响位深判定。"
+              fi
+            else
+              # uavs3d 的 VERSION_STR 上游一直停在 "1.2.1"（新旧版都报 1.2.1），
+              # 版本号无参考价值；可信的是 .rodata 里的 40 位 git SHA1。
+              v=$(strings "$so" 2>/dev/null | grep -oE '[0-9a-f]{40}' | head -1)
+              echo "  VERSION_SHA1: ${v:-<none>}"
+              case "$v" in
+                590f8df384934e9c0464b763bafd5f2b229a114b)
+                  echo "  [FAIL] 命中已知旧版（版本被 .pc 手写锁死 1.2.1）"
+                  fail=1 ;;
+                "") echo "  [?]    取不到 SHA1" ;;
+                *)  echo "  [OK]   非已知旧版 commit" ;;
+              esac
+              echo "  [info] uavs3d 无静态位深判据 —— 需跑 probes/uavs3dprobe 验证"
+              echo "         （判据 max_out_bit_depth >= 10 且 ERR_BAD_BITDEPTH == 0）"
+            fi
+          done
+
+          # uavs3d 版本别太老：旧版 NAL 0xB2 报 ERR_UNKNOWN_NAL
+          if [ -f "$ABI_DIR/libuavs3d.so" ]; then
+            v=$(strings "$ABI_DIR/libuavs3d.so" 2>/dev/null | grep -oE '1\.[0-9]+\.[0-9]+_release' | head -1)
+            echo "  uavs3d release: ${v:-unknown}"
+            # SHA1 判据已在上面的循环里做过，这里不再重复
+          fi
+
+          [ "$fail" = "0" ] || { echo "::error::自检未通过，终止流水线"; exit 1; }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-cavs-android-${{ matrix.arch.name }}
+          path: mpv-android/buildscripts/artifacts/${{ matrix.arch.name }}/
+          retention-days: 7
+
+  release:
+    name: Package and upload
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libmpv-cavs-android-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Package
+        run: |
+          mkdir -p release/jniLibs
+          for arch in arm64-v8a armeabi-v7a; do
+            DIR="artifacts/libmpv-cavs-android-$arch"
+            if [ -d "$DIR" ]; then
+              mkdir -p "release/jniLibs/$arch"
+              cp "$DIR"/*.so "release/jniLibs/$arch/"
+              echo "=== $arch ==="
+              ls -la "release/jniLibs/$arch/"
+            fi
+          done
+          # Copy AV3A model.bin to release
+          for arch in arm64-v8a armeabi-v7a; do
+            DIR="artifacts/libmpv-cavs-android-$arch"
+            if [ -d "$DIR/assets" ]; then
+              mkdir -p "release/assets"
+              cp "$DIR/assets/"* "release/assets/" 2>/dev/null || true
+              echo "Copied assets from $arch"
+              break
+            fi
+          done
+          for arch in arm64-v8a armeabi-v7a; do
+            [ -f "release/jniLibs/$arch/libmpv.so" ] || { echo "ERROR: missing $arch libmpv.so"; exit 1; }
+            [ -f "release/jniLibs/$arch/libavcodec.so" ] || { echo "ERROR: missing $arch libavcodec.so"; exit 1; }
+            [ -f "release/jniLibs/$arch/libdavs2.so" ] || { echo "ERROR: missing $arch libdavs2.so"; exit 1; }
+          done
+          cd release
+          if [ -d assets ]; then
+            tar czf libmpv-cavs-android-dynamic.tar.gz jniLibs assets
+          else
+            tar czf libmpv-cavs-android-dynamic.tar.gz jniLibs
+          fi
+          ls -lh libmpv-cavs-android-dynamic.tar.gz
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: release/libmpv-cavs-android-dynamic.tar.gz
+          fail_on_unmatched_files: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

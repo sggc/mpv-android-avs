@@ -1,0 +1,22 @@
+# 强制 LF —— 这些文件一旦变成 CRLF 会直接坏掉
+#
+# 实测踩坑（本仓库存在的理由之一）：davs2 的 build/linux/{configure,config.sub,
+# config.guess,Makefile} 在 Windows 上被 Git 转成 CRLF 后，bash 解析会挂死且
+# 零输出，极难诊断。同样，patches/*.patch 被转成 CRLF 会让 git apply 失败，
+# scripts/*.sh 会因 ^M 报语法错。
+* text=auto eol=lf
+
+# 明确逐个钉死（* text=auto eol=lf 已覆盖，这里再显式声明以防配置漂移）
+*.patch     text eol=lf
+*.sh        text eol=lf
+*.py        text eol=lf
+*.c         text eol=lf
+*.h         text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.md        text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# 日志/文本大文件按文本处理，但要 diff 就要明确标记，避免 git 当二进制
+*.txt       text
