@@ -107,6 +107,7 @@ checkout 本仓库
   → Apply davs2 / uavs3d patches   ← git apply，不是 sed
        ├ davs2-10bit.patch          （10bit 三处）
        ├ davs2-seek-deadlock.patch  （seek 后 mutex_aec 锁泄漏 → ANR 根因）
+       ├ davs2-flush-crash.patch    （flush 强制解码缓冲 AU → SIGSEGV 根因）
        └ uavs3d-10bit.patch         （clone 之后单独应用）
   → Patch davs2 source          ← 上游的线程池同步化 + NULL 安全
   → Build libuavs3d             ← cmake -DCOMPILE_10BIT=1
@@ -185,6 +186,11 @@ ffmpeg -v error -y -i input.mkv -map 0:v:0 -c:v copy -f data out.avs2
   时 `decoder_decode_es_unit()` 不解锁就走人，下一次 `send_packet` 永久阻塞。    
   上游 `master` 已修，`1.6` 没有 —— 由 `patches/davs2-seek-deadlock.patch` 补上。    
   详见 `patches/README.md`。**这是「拖进度条卡死闪退」的根因。**
+* **`davs2_decoder_flush()` 会强制解码缓冲里那个"未封口"的 AU**，seek 截断流之后
+  解码它会越界读 → **SIGSEGV**（「拖进度条闪退」的第二个、也是真正 native 的根因）。
+  上游 master 这段与 1.6 一致，所以是我们自己的修复 ——
+  由 `patches/davs2-flush-crash.patch` 把强制解码改成丢弃。
+  真机 A/B：同一个 `pre=20` 场景，原版 `EXIT=139 (SIGSEGV)`、修复版 `EXIT=0`。
 - **app 侧不要把 `mpv_get_property` 放在主线程**：`mpv_get_property` 是同步调用，    
   mpv core 一卡住它就永不返回 → 5 秒输入超时 → ANR。本项目实测的主线程栈是    
   `CustomSeekView.onScrubStop → seekToTimeBarPosition → updateProgress →
@@ -201,7 +207,8 @@ ffmpeg -v error -y -i input.mkv -map 0:v:0 -c:v copy -f data out.avs2
 ## 待办
 
 - [x] uavs3d 10bit 真机复验 —— **通过**（14 帧，`bit_depth=10`，`ERR_BAD_BITDEPTH=0`）
-- [x] davs2 seek 死锁修复（`davs2-seek-deadlock.patch`）—— 待 CI 重编后真机复验
+- [x] davs2 seek 死锁修复（`davs2-seek-deadlock.patch`）—— 已真机 A/B 复验
+- [x] davs2 flush SIGSEGV 修复（`davs2-flush-crash.patch`）—— 已真机 A/B 复验
 - [ ] **app 侧加固**：`CustomSeekView.updateProgress()` 在松手回调里同步调    
   `PlayerManager.getPosition()` → `mpv_get_property()`（阻塞）。应改为    
   后台线程读取 + 缓存（或改用 mpv 的 `time-pos` 属性变更事件），    

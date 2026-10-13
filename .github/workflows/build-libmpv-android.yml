@@ -251,6 +251,9 @@ jobs:
           # davs2: seek 后 mutex_aec 泄漏导致永久死锁（拖住整个视频管线 → ANR）
           # upstream master 已有 else 分支，我们 pin 的 1.6 分支没有 —— 补上。
           apply "davs2"  "$DAVS2_DIR" davs2-seek-deadlock.patch
+          # davs2: davs2_decoder_flush() 强制解码缓冲里那个"未封口"的 AU，
+          # seek 截断流之后解码它会越界读 → SIGSEGV（拖进度条闪退的第二个缺陷）
+          apply "davs2"  "$DAVS2_DIR" davs2-flush-crash.patch
 
           # uavs3d 的补丁**不在这里**打：uavs3d-src 要到后面的
           # "Build libuavs3d" step 才 clone，此刻目录还不存在。

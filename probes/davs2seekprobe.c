@@ -33,29 +33,34 @@
  * 判读： 打印 "RESULT NO_DEADLOCK" 并正常退出 = 走完了整条路径
  *        卡在某次 send 上并最终被 kill   = 复现了阻塞
  *
- * ⚠️ 正确用法（关键）：必须 `flush=0`，且失败点之后要**继续多发几个 AU**。
- * 2026-10-13 第一次尝试用 flush=1，新老库都在 davs2_decoder_flush() 里挂住
- * ——那是「同步线程池 stub + 拿垃圾数据喂 4K 流」的另一类卡顿，**与本 bug 无关**，
- * 会掩盖真正的现象。改成 flush=0 后对照非常干净。
- *
- * 实测结果（2026-10-13，ATV_S905L3 / armv7，cctv4k10.avs2，jump=40 pre=4）
+ * 两个独立的缺陷都能用本探针复现/验证（2026-10-13，真机 arm64 + armv7）
  * ---------------------------------------------------------------------------
- *   老库 libdavs2_OLD.so（无修复）：
- *     STEP 5.1  send AU[41] → "reference frame of [coi: 64, poc: 62]: <COI: 63>
- *                              not found." → 返回 0  ← mutex_aec 在这里被泄漏
- *     STEP 5.2  send AU[42] → **永久挂住**，15s 后 alarm 触发
- *     RESULT DEADLOCK_REPRODUCED   EXIT=99
  *
- *   新库 libdavs2_NEW.so（含修复）：
- *     STEP 5.1  send AU[41] → 同样报 reference not found → 返回 0
- *     STEP 5.2  send AU[42] → 报错但返回 0，继续
- *     STEP 5.3 / 5.4        → 各报一次错，都正常返回
- *     RESULT NO_DEADLOCK           EXIT=0
+ * 【A】mutex_aec 锁泄漏死锁（→ ANR）—— 用 flush=0
+ *   老库：AU[41] 报 "reference frame ... not found" → 返回 0（锁在此泄漏）
+ *         AU[42] → 永久挂住 → 15s alarm → DEADLOCK_REPRODUCED  EXIT=99
+ *   新库：同样报错但返回 0，AU[42]/[43]/[44] 各报一次错都正常返回
+ *         → NO_DEADLOCK  EXIT=0
  *
- * → 同一输入、同一触发点，唯一差异就是 decoder_decode_es_unit() 里那个
- *   `else { unlock; task_unload_packet; }`。**修复有效已被真机 A/B 证实。**
+ * 【B】davs2_decoder_flush() 强制解码缓冲 AU → SIGSEGV —— 用 flush=1 pre=20
+ *   NOFIX：EXIT=139 (SIGSEGV)，日志停在 flush 里的 "invalid CU ... POC 43"，
+ *          崩溃栈与 app tombstone 逐帧一致：
+ *            #00 libdavs2+0x11174 / #01 davs2_get_recons+424
+ *            #04 davs2_decoder_decode_picture_data+1988
+ *            #05 davs2_threadpool_run+36 / #06 decoder_decode_es_unit+448
+ *            #07 davs2_decoder_flush+64
+ *   FIX  ：EXIT=0，完整跑完
+ *   → 不涉及 seek/截断/重放，**就是 flush 本身**（pre=8/12/30 不崩，依赖 DPB 状态）
  *
- * 编译： armv7a-linux-androideabi21-clang -O2 -fPIE -pie -march=armv7-a \
+ * ⚠️ 两个必须注意的坑（都踩过）
+ *   1) AU 切分必须与 davs2 的 DAVS2_ISUNIT（B0/B1/B7/B3/B6）完全一致；
+ *      漏了 B1/B7 会喂错位数据 → 得到"新老库都挂死"的**假**结论。
+ *   2) 用 flush=0 验【A】时，失败点之后要**继续多发几个 AU** —— 只发一个的话
+ *      泄漏了也没人暴露，会误判成"没复现"。
+ *
+ * 其它已试过、**不**触发【B】的构造（免得重复劳动）：截断 AU 1%~80%、
+ * flush 后重喂同一批 AU。
+ * * 编译： armv7a-linux-androideabi21-clang -O2 -fPIE -pie -march=armv7-a \
  *          -mfpu=neon -mfloat-abi=softfp -o davs2seekprobe32 davs2seekprobe.c -ldl
  *        aarch64-linux-android21-clang -O2 -fPIE -pie -o davs2seekprobe64 davs2seekprobe.c -ldl
  */
@@ -149,7 +154,12 @@ static void build_au_index(const uint8_t *b, long n)
     while (i + 4 < n && g_nau < MAX_AU) {
         if (b[i] == 0 && b[i+1] == 0 && b[i+2] == 1) {
             uint8_t t = b[i+3];
-            if (t == 0xB0 || t == 0xB3 || t == 0xB6) {
+            /* 必须与 davs2 自己的 DAVS2_ISUNIT 完全一致：
+             *   B0 / B1 / B7 / B3 / B6
+             * 少一个都会让喂进去的"AU"和 davs2 认定的单元边界错位，
+             * 于是它解出来的是错位数据 —— 会得到假的崩溃/卡死结论。
+             * （第一次就漏了 B1/B7，白折腾一轮。） */
+            if (t == 0xB0 || t == 0xB1 || t == 0xB7 || t == 0xB3 || t == 0xB6) {
                 if (g_nau > 0) g_au[g_nau-1].len = i - g_au[g_nau-1].off;
                 g_au[g_nau].off  = i;
                 g_au[g_nau].len  = n - i;      /* 先给到文件尾，稍后修正 */
@@ -164,7 +174,14 @@ static void build_au_index(const uint8_t *b, long n)
 
 static const char *auname(uint8_t t)
 {
-    return t == 0xB0 ? "SEQHDR(B0)" : t == 0xB3 ? "I(B3)" : "PB(B6)";
+    switch (t) {
+    case 0xB0: return "SEQHDR(B0)";
+    case 0xB1: return "SEQEXT(B1)";
+    case 0xB7: return "SEQDIS(B7)";
+    case 0xB3: return "I(B3)";
+    case 0xB6: return "PB(B6)";
+    default:   return "?(?)";
+    }
 }
 
 /* ---------------- 解码器 ---------------- */
@@ -188,6 +205,8 @@ static void drain(const char *tag)
 }
 
 /* 返回 send_packet 的返回值 */
+static long g_trunc_len = 0;   /* >0 = 只发这么多字节：模拟"被 seek 截断的 AU" */
+
 static int feed(int idx)
 {
     davs2_packet_t p;
@@ -199,6 +218,9 @@ static int feed(int idx)
     extern uint8_t *g_buf;
     p.data = g_buf + g_au[idx].off;
     p.len  = (int)g_au[idx].len;
+    if (g_trunc_len > 0 && g_trunc_len < g_au[idx].len) {
+        p.len = (int)g_trunc_len;      /* 截断：只喂前 N 字节 */
+    }
     p.pts  = idx;
     return fn_send(g_dec, &p);
 }
@@ -217,12 +239,14 @@ static void on_alarm(int sig)
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <libdavs2.so> <in.avs2> [jump=40] [pre=6] [flush=1]\n", argv[0]);
+        fprintf(stderr, "usage: %s <libdavs2.so> <in.avs2> [jump=40] [pre=6] [flush=1] [truncPct=0] [replay=0]\n", argv[0]);
         return 2;
     }
     int jump = (argc >= 4) ? atoi(argv[3]) : 40;
     int pre  = (argc >= 5) ? atoi(argv[4]) : 6;
     int dofl = (argc >= 6) ? atoi(argv[5]) : 1;
+    int truncPct = (argc >= 7) ? atoi(argv[6]) : 0;
+    int replay   = (argc >= 8) ? atoi(argv[7]) : 0;
 
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "dlopen failed: %s\n", dlerror()); return 1; }
@@ -273,8 +297,19 @@ int main(int argc, char **argv)
     drain("seqhdr");
 
     /* ---- 2. 正常解几帧，填 DPB ---- */
+    /* truncPct>0 时，最后一个 pre AU 只喂前 truncPct% 字节 ——
+     * 模拟"seek 把流截断在帧中间"，此时 mgr->es_unit 里留的是半截 AU。
+     * 紧接着的 davs2_decoder_flush() 会强制解码这半截 AU → 真实场景的崩溃。 */
     for (int i = 1; i <= pre && i < g_nau; i++) {
+        g_trunc_len = 0;
+        if (truncPct > 0 && i == pre) {
+            g_trunc_len = g_au[i].len * (long)truncPct / 100;
+            if (g_trunc_len < 8) g_trunc_len = 8;
+            fprintf(stderr, "STEP 2  ** 截断 AU[%d]: 只喂 %ld / %ld 字节 (%d%%) **\n",
+                    i, g_trunc_len, g_au[i].len, truncPct);
+        }
         int r = feed(i);
+        g_trunc_len = 0;
         fprintf(stderr, "STEP 2  send AU[%d] %s -> %d\n", i, auname(g_au[i].type), r);
         drain("pre");
     }
@@ -289,6 +324,25 @@ int main(int argc, char **argv)
         drain("flush");
     } else {
         fprintf(stderr, "STEP 3  (跳过 flush)\n");
+    }
+
+    /* ---- 3b. replay：flush 之后重新喂同一批 AU ----
+     * 模拟"seek 回到同一位置、重解同一批帧"。davs2_decoder_flush() 并不清
+     * DPB，于是新帧的 COI 会撞上 DPB 里的旧帧 -> task_get_references()
+     * 以为"找到了" -> 拿陈旧参考帧解码 -> 预测全错 -> 变换块尺寸变垃圾 ->
+     * add_ps[PART_INDEX()] 越界取到别的函数 -> 参数错位 -> 越界读 -> SIGSEGV。
+     */
+    if (replay) {
+        fprintf(stderr, "STEP 3b REPLAY：flush 后重新喂 AU[1..%d]（DPB 未清，COI 会撞旧帧）\n", pre);
+        for (int i = 1; i <= pre && i < g_nau; i++) {
+            int r = feed(i);
+            fprintf(stderr, "STEP 3b send AU[%d] %s -> %d\n", i, auname(g_au[i].type), r);
+            drain("replay");
+        }
+        fprintf(stderr, "\nRESULT REPLAY_SURVIVED\n");
+        fflush(stderr);
+        fn_close(g_dec);
+        return 0;
     }
 
     /* ---- 4. 跳跃：喂流中段的 P/B 帧，参考帧不在 DPB 里 ---- */

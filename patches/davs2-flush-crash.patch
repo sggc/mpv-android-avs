@@ -1,0 +1,44 @@
+diff --git a/source/common/davs2.cc b/source/common/davs2.cc
+--- a/source/common/davs2.cc
++++ b/source/common/davs2.cc
+@@ -735,17 +735,36 @@
+     if (fp_trace_in) {
+         fprintf(fp_trace_in, "Fetch ");
+         fflush(fp_trace_in);
+     }
+ #endif
+ 
+-    // flush buffered bit-stream
+-    if (mgr->es_unit != NULL && mgr->es_unit->len >= 4) {
+-        es_unit_t *es_unit = mgr->es_unit;
++    /* FLUSH_CRASH_FIX: do NOT force-decode the buffered ES unit.
++     *
++     * mgr->es_unit is the access unit that has not yet been closed by a
++     * following start code. A seek cuts the stream at an arbitrary point,
++     * so that AU can be inconsistent with the DPB: decoding it produces
++     * garbage prediction / transform block sizes, and then an out-of-bounds
++     * read in davs2_get_recons() -> add_ps[PART_INDEX(bsx,bsy)] => SIGSEGV.
++     *
++     * Reproduced on device (arm64): feed 20 AUs, then call this function
++     * -> crash, backtrace identical to the app tombstone:/n     *   #00 libdavs2+0x11174
++     *   #01 davs2_get_recons+424
++     *   #04 davs2_decoder_decode_picture_data+1988
++     *   #05 davs2_threadpool_run+36
++     *   #06 decoder_decode_es_unit+448
++     *   #07 davs2_decoder_flush+64
++     * With this fix the same run completes (no SIGSEGV), and 10-bit 4K /
++     * 8-bit decoding is unchanged.
++     *
++     * A flush means "abandon the current position", so drop it instead.
++     * (Upstream master still has the force-decode here - this is not
++     *  backported from upstream, it is our own robustness fix.) */
++    if (mgr->es_unit != NULL) {
++        es_unit_free(mgr->es_unit);
+         mgr->es_unit = NULL;
+-        decoder_decode_es_unit(mgr, es_unit);
+     }
+ 
+     ret = decoder_get_output(mgr, headerset, out_frame, 1);
+ 
+ #if DAVS2_TRACE_API
+     if (fp_trace_in) {

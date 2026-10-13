@@ -219,6 +219,124 @@ davs2 修好只是让这次不再触发它。
 
 ---
 
+## davs2-flush-crash.patch
+
+**目的**：修掉「拖进度条闪退」的**第二个**缺陷 —— 原生 SIGSEGV。
+
+> 背景：`davs2-seek-deadlock.patch` 修好之后，症状从 **ANR** 变成了 **native crash**。
+> 也就是说前一个是"卡死被系统杀"，这一个才是"真崩"。两个都在同一条 flush 路径上。
+
+### 症状（真机实测，vivo PD2520 / arm64 / Android 13）
+
+拖进度条 → 画面卡住 → 应用直接退出（`Fatal signal 11`）。日志：
+
+```
+19:02:06.836 [mkv:v] queuing seek to -0.317000      ← 负数 seek（mpv 收敛到 0.023）
+19:02:07.533 Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR),
+             fault addr 0x70bf8eb2b8, tid 18280 (Thread-20)
+```
+
+tombstone 里的栈：
+
+```
+#00 pc 0x11174  libdavs2.so
+#01 pc 0x35c50  libdavs2.so  (davs2_get_recons+424)
+#02 pc 0x159e8  libdavs2.so  (davs2_decode_lcu_recon+3120)
+#03 pc 0x14e48  libdavs2.so  (davs2_decode_lcu_recon+144)
+#04 pc 0x17ea8  libdavs2.so  (davs2_decoder_decode_picture_data+1988)
+#05 pc 0x3989c  libdavs2.so  (davs2_threadpool_run+36)
+#06 pc 0x1272c  libdavs2.so  (decoder_decode_es_unit+448)
+#07 pc 0x12adc  libdavs2.so  (davs2_decoder_flush+64)     ← 入口
+#08 libavcodec.so
+```
+
+> 顺带说：`#06 +448` 正好等于新库里 `bl davs2_threadpool_run` 的返回地址减 4
+> （老库是 +444），所以这条栈同时也证明了 APK 里跑的确实是新库。
+
+### 机制（寄存器级）
+
+崩溃指令与寄存器：
+
+```
+1115c:  madd  w8, w10, w2, w3     ← w8 = w10*w2 + w3
+11160:  sbfiz x12, x8, #1, #32    ← 偏移 x12 = w8*2（按 32 位截断）
+11168:  add   x11, x1, x12        ← x11 = 平面基址 + 偏移
+11174:  ldrh  w9, [x11]           ← 崩在这里
+```
+
+真机寄存器：`x1=0x6febebf740`（合法平面基址）、`x3=0x6c69d15d9c`（**是个指针**）、
+`w10=8`、`w2=4` → `x12=0xd3a2bb78` → `x11=0x70bf8eb2b8`（帧缓冲之外）→
+`SEGV_MAPERR (read)`，`esr=0x92000005`（读操作、一级页表翻译失败）。
+
+也就是说：`davs2_get_recons()` 里
+
+```c
+gf_davs2.add_ps[PART_INDEX(bsx, bsy)](p_dst, i_dst, p_dst, p_coeff, i_dst, i_coeff);
+```
+
+拿到的**块尺寸/参数是垃圾** → 偏移算出天文数字 → 越界读。
+而垃圾的来源是：**正在解码的这帧的比特流与 DPB 状态不一致**。
+
+### 根因
+
+`source/common/davs2.cc` 的 `davs2_decoder_flush()`：
+
+```c
+    mgr->b_flushing = 1;
+    ...
+    // flush buffered bit-stream
+    if (mgr->es_unit != NULL && mgr->es_unit->len >= 4) {
+        es_unit_t *es_unit = mgr->es_unit;
+        mgr->es_unit = NULL;
+        decoder_decode_es_unit(mgr, es_unit);   // ← 强制解码这个 AU
+    }
+```
+
+`mgr->es_unit` 是**还没被下一个起始码"封口"的那个 access unit**
+（`davs2_pack_es_unit()` 只在下一个 B0/B1/B7/B3/B6 到来时才把它交出去）。
+seek 会把流截在任意位置，这个 AU 的比特流与 DPB 里的参考帧可能对不上，
+**强行解码它就会解出垃圾**（预测模式、变换块尺寸全错）→ `add_ps[]` 越界 → SIGSEGV。
+
+### 修法
+
+把"强制解码"改成"丢弃"：
+
+```c
+    if (mgr->es_unit != NULL) {
+        es_unit_free(mgr->es_unit);
+        mgr->es_unit = NULL;
+    }
+```
+
+理由：**flush 的语义就是"放弃当前位置"**，这个 AU 本来就没封口、也没人再要它。
+
+> ⚠️ **这段上游 master 与 1.6 完全一致（都没改）**，所以这个补丁不是从上游抄的，
+> 是我们自己的健壮性修复。
+
+### 真机 A/B 实测（决定性，2026-10-13，vivo PD2520 / arm64）
+
+`probes/davs2seekprobe.c` 复现：喂 20 个 AU（正常解码）→ 调 `davs2_decoder_flush()`。
+
+```
+NOFIX（原始 flush）  EXIT=139 (128+11 SIGSEGV)
+                     日志停在 flush 里的 "invalid CU (48,1488), POC 43"
+                     崩溃栈与 app tombstone 逐帧一致
+
+FIX（flush 丢弃）    EXIT=0，完整跑完
+```
+
+**回归**（FIX 版）：AVS2 10bit 4K → 16 帧 `bit_depth=10 err=0`；
+AVS2 8bit → 3 帧 `bit_depth=8 err=0`，**不退化**。
+
+> 排查记录（免得下次重走）：
+> * 探针的 AU 切分必须与 davs2 的 `DAVS2_ISUNIT`（**B0/B1/B7/B3/B6**）一致 ——
+>   漏了 B1/B7 会喂错位数据，得到"新老库都挂死"的**假**结论。
+> * 截断 AU（1%~80%）、flush 后重喂同一批 AU，**都不会崩**；
+>   真正稳定的复现条件是「解够多帧（约 20 帧）后调 flush」。
+> * 这个 bug 与 seek/截断/重放都无关，**是 `davs2_decoder_flush` 本身**。
+
+---
+
 ## uavs3d-10bit.patch
 
 **目的**：让 uavs3d 输出 10bit。官方默认就是 8bit-only。
