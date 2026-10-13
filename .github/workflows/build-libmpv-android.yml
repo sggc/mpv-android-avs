@@ -219,8 +219,9 @@ jobs:
       - name: Apply 10-bit patches (davs2 / uavs3d)
         run: |
           cd "$GITHUB_WORKSPACE"
-          PATCH_DIR="$GITHUB_WORKSPACE/mpv-android-avs/patches"
-          [ -d "$PATCH_DIR" ] || PATCH_DIR="$GITHUB_WORKSPACE/patches"
+          # 本仓库被 checkout 到 $GITHUB_WORKSPACE 根，patches/ 就在下面
+          PATCH_DIR="$GITHUB_WORKSPACE/patches"
+          [ -d "$PATCH_DIR" ] || { echo "::error::patches/ 目录不存在于 $GITHUB_WORKSPACE"; ls -la "$GITHUB_WORKSPACE" | head -30; exit 1; }
 
           apply() {
             local name="$1" dir="$2" patch="$3"
@@ -248,12 +249,10 @@ jobs:
                         -name davs2 -path "*/deps/*" 2>/dev/null | head -1)
           apply "davs2"  "$DAVS2_DIR" davs2-10bit.patch
 
-          # uavs3d: COMPILE_10BIT 默认 0 -> 1
-          # 该目录由后面的 "Build libuavs3d" step clone 出来，若它先跑则这里已存在；
-          # 若顺序变化（uavs3d 后 clone），本 step 会 warning 跳过，uavs3d 那边
-          # 的 cmake 已带 -DCOMPILE_10BIT=1，不依赖本 patch。
-          UAVS3D_DIR="$GITHUB_WORKSPACE/uavs3d-src"
-          apply "uavs3d" "$UAVS3D_DIR" uavs3d-10bit.patch
+          # uavs3d 的补丁**不在这里**打：uavs3d-src 要到后面的
+          # "Build libuavs3d" step 才 clone，此刻目录还不存在。
+          # 它的补丁在 clone 之后立即应用（见那个 step 的注释）。
+          # 这里只做存在性提示，避免有人误以为漏了。
 
       - name: Patch davs2 source — disable threading + NULL safety
         run: |
@@ -1266,6 +1265,32 @@ jobs:
           echo "=== Cloning uavs3d ==="
           git clone --depth 1 https://github.com/uavs3/uavs3d.git uavs3d-src
 
+          # ------------------------------------------------------------------
+          # AVS3 10bit：应用 patches/uavs3d-10bit.patch（把 com_def.h 的
+          # COMPILE_10BIT 默认值 0 改成 1）。
+          #
+          # 必须放在这里而不是前面的 "Apply 10-bit patches" step —— 那时
+          # uavs3d-src 还没 clone（本 step 才 clone），补丁会被跳过。
+          # 下面 cmake 也传了 -DCOMPILE_10BIT=1，双保险：任一处失效，
+          # "Verify 10-bit support" 自检或真机探针都能发现。
+          # ------------------------------------------------------------------
+          PATCH_DIR="$GITHUB_WORKSPACE/patches"
+          if [ -f "$PATCH_DIR/uavs3d-10bit.patch" ]; then
+            if (cd uavs3d-src && git apply --check "$PATCH_DIR/uavs3d-10bit.patch" 2>/dev/null); then
+              (cd uavs3d-src && git apply "$PATCH_DIR/uavs3d-10bit.patch")
+              echo "[OK] uavs3d-10bit.patch applied"
+            elif (cd uavs3d-src && git apply --reverse --check "$PATCH_DIR/uavs3d-10bit.patch" 2>/dev/null); then
+              echo "[SKIP] uavs3d-10bit.patch already applied"
+            else
+              echo "::error::uavs3d-10bit.patch 无法应用 —— 上游 com_def.h 结构变了？"
+              (cd uavs3d-src && git apply --check "$PATCH_DIR/uavs3d-10bit.patch")
+              exit 1
+            fi
+            grep -n "COMPILE_10BIT" uavs3d-src/source/decore/com_def.h | head -3
+          else
+            echo "::warning::$PATCH_DIR/uavs3d-10bit.patch 不存在，仅靠 cmake -DCOMPILE_10BIT=1"
+          fi
+
           # Patch: Android/Bionic has pthread built into libc, no -lpthread needed
           echo "=== Patching uavs3d CMakeLists.txt for Android ==="
           # Disable find_package(Threads) entirely
@@ -1415,14 +1440,58 @@ jobs:
             echo "nm tool not found, skipping symbol inspection"
           fi
 
+          # ------------------------------------------------------------------
+          # ⚠️ AV3A 公开 API 检查（重要，别删）
+          #
+          # src/av3a_dec.c 优先 dlsym **公开 API**：
+          #     avs3_create_decoder / avs3_destroy_decoder / parse_header / avs3_decode
+          # 找不到时才回退到**内部名**（Avs3AllocDecoder / Avs3ParseBsFrameHeader /
+          # Avs3Decode）—— 但内部名签名不同（parse_header 是 4 参不是 6 参、
+          # avs3_decode 不收输入缓冲），**那正是历史上 SIGSEGV 的路径**。
+          #
+          # 已知情况：本仓 App 内 jniLibs 在用的版本（约 347K）公开 API 与内部名
+          # 都有；而这里从 wuxianlin/ijkplayer-av3a 下载的预编译版约 254K，
+          # 是**另一个构建**，是否含公开 API 必须实查。
+          #
+          # 这里不直接 fail（避免误伤），但会把结论醒目打出来。
+          # ------------------------------------------------------------------
+          echo "=== Step 1c: AV3A public-API check (决定 dlsym 走公开 API 还是回退内部名) ==="
+          if [ -f "$NM_TOOL" ]; then
+            api_missing=""
+            for sym in avs3_create_decoder avs3_destroy_decoder parse_header avs3_decode; do
+              if "$NM_TOOL" -D av3a-libs/libavs3a_decoder.so 2>/dev/null | grep -qE " T ${sym}$"; then
+                echo "  [OK]   公开 API 存在: $sym"
+              else
+                echo "  [MISS] 公开 API 缺失: $sym"
+                api_missing="$api_missing $sym"
+              fi
+            done
+            if [ -n "$api_missing" ]; then
+              echo "::warning title=AV3A 将回退到内部符号名::下载的 libavs3a_decoder.so 缺公开 API:$api_missing —— wrapper 会回退到 Avs3AllocDecoder/Avs3ParseBsFrameHeader/Avs3Decode，而这些符号签名不同，是历史上崩溃的路径。请确认该 .so 是否与 App 内已验证版本(约347K)一致。"
+            else
+              echo "  [OK]   公开 API 齐全，wrapper 不会走内部名回退路径"
+            fi
+          fi
+
           echo "=== Step 2: Patch FFmpeg to add AV3A codec support ==="
           cd "$GITHUB_WORKSPACE/mpv-android/buildscripts"
           FFMPEG_ABS=$(cd "$FFMPEG_DIR" && pwd)
           echo "FFmpeg dir: $FFMPEG_ABS"
 
           # 3a. Write av3a_dec.c (FFmpeg AVCodec wrapper)
-          cp "$GITHUB_WORKSPACE/av3a_dec.c" "$FFMPEG_ABS/libavcodec/av3a_dec.c"
-          echo "Copied av3a_dec.c to libavcodec/"
+          # 本仓库把它放在 src/ 下（迁移时做过目录整理）；为兼容也接受根目录，
+          # 免得日后挪动位置又静默失败。
+          AV3A_SRC=""
+          for cand in "$GITHUB_WORKSPACE/src/av3a_dec.c" "$GITHUB_WORKSPACE/av3a_dec.c"; do
+            [ -f "$cand" ] && { AV3A_SRC="$cand"; break; }
+          done
+          [ -n "$AV3A_SRC" ] || {
+            echo "ERROR: av3a_dec.c not found (looked in src/ and repo root)"
+            echo "--- repo root listing ---"; ls -la "$GITHUB_WORKSPACE" | head -30
+            exit 1
+          }
+          cp "$AV3A_SRC" "$FFMPEG_ABS/libavcodec/av3a_dec.c"
+          echo "Copied $AV3A_SRC -> libavcodec/av3a_dec.c"
 
           # 3b. Add AV_CODEC_ID_AV3A to codec_id.h
           CODEC_ID_H="$FFMPEG_ABS/libavcodec/codec_id.h"
